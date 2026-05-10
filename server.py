@@ -321,18 +321,18 @@ async def send_email_otp(email: str, otp_code: str) -> bool:
         </html>
         """
 
-      msg.attach(MIMEText(body, "html"))
+       msg.attach(MIMEText(body, "html"))
 
-      server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
-      server.ehlo()
-      server.starttls()
-      server.ehlo()
-      server.login(SMTP_EMAIL, SMTP_PASSWORD)
-      server.send_message(msg)
-      server.quit()
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
 
-      logger.info(f"OTP sent successfully to {email}")
-      return True
+        logger.info(f"OTP sent successfully to {email}")
+        return True
 
     except Exception as e:
         logger.error(f"Failed to send OTP email to {email}: {str(e)}")

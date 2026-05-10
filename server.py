@@ -18,6 +18,7 @@ import random
 import string
 import shutil
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -109,6 +110,7 @@ class AboutSection(BaseModel):
 
 class EnquirySubmission(BaseModel):
     model_config = ConfigDict(extra="ignore")
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str
     email: EmailStr
@@ -117,23 +119,63 @@ class EnquirySubmission(BaseModel):
     subject: str
     product_interest: str
     message: str
+
+    status: str = "Pending"
+    admin_note: str = ""
+
     read: bool = False
+
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class RepairSubmission(BaseModel):
     model_config = ConfigDict(extra="ignore")
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+
     name: str
     email: EmailStr
     phone: str
     organization: Optional[str] = ""
+
     equipment_category: str
     equipment_variant: Optional[str] = ""
     serial_number: Optional[str] = ""
+
     issue_description: str
+
     image_urls: List[str] = []
+
+    status: str = "Pending"
+    admin_note: str = ""
+
     read: bool = False
+
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class StatusUpdateRequest(BaseModel):
+    status: str
+    admin_note: Optional[str] = ""
+
+
+class FormField(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    form_type: str  # enquiry or repair
+    section: str = "Main"
+    label: str
+    field_key: str
+    field_type: str = "text"  # text, email, phone, textarea, select, file
+    placeholder: str = ""
+    required: bool = True
+    options: List[str] = []
+    sort_order: int = 0
+    active: bool = True
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
 
 class PageContent(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -600,6 +642,7 @@ async def submit_enquiry(enquiry: EnquirySubmission):
 
         doc = enquiry.model_dump()
         doc["created_at"] = doc["created_at"].isoformat()
+        doc["updated_at"] = doc["updated_at"].isoformat()
         await db.contact_submissions.insert_one(doc)
 
         try:
@@ -644,6 +687,7 @@ async def submit_repair(repair: RepairSubmission):
 
         doc = repair.model_dump()
         doc["created_at"] = doc["created_at"].isoformat()
+        doc["updated_at"] = doc["updated_at"].isoformat()
         await db.repair_submissions.insert_one(doc)
 
         try:
@@ -679,9 +723,73 @@ async def get_enquiries(payload: dict = Depends(verify_jwt_token)):
     """Get all enquiries (Admin only)"""
     enquiries = await db.contact_submissions.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
     for enq in enquiries:
+        enq.setdefault("status", "Pending")
+        enq.setdefault("admin_note", "")
         if isinstance(enq.get("created_at"), str):
             enq["created_at"] = datetime.fromisoformat(enq["created_at"]).isoformat()
+        if isinstance(enq.get("updated_at"), str):
+            enq["updated_at"] = datetime.fromisoformat(enq["updated_at"]).isoformat()
     return enquiries
+
+
+@api_router.put("/enquiries/{enquiry_id}/status")
+async def update_enquiry_status(
+    enquiry_id: str,
+    request: StatusUpdateRequest,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Update enquiry status/admin note (Admin only)"""
+    result = await db.contact_submissions.update_one(
+        {"id": enquiry_id},
+        {
+            "$set": {
+                "status": request.status,
+                "admin_note": request.admin_note or "",
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+        }
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Enquiry not found")
+
+    return {"message": "Enquiry status updated successfully"}
+
+
+@api_router.put("/enquiries/{enquiry_id}")
+async def update_enquiry(
+    enquiry_id: str,
+    updates: Dict[str, Any],
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Update full enquiry record (Admin only)"""
+    updates.pop("_id", None)
+    updates.pop("id", None)
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    result = await db.contact_submissions.update_one(
+        {"id": enquiry_id},
+        {"$set": updates}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Enquiry not found")
+
+    return {"message": "Enquiry updated successfully"}
+
+
+@api_router.delete("/enquiries/{enquiry_id}")
+async def delete_enquiry(
+    enquiry_id: str,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Delete enquiry record (Admin only)"""
+    result = await db.contact_submissions.delete_one({"id": enquiry_id})
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Enquiry not found")
+
+    return {"message": "Enquiry deleted successfully"}
 
 
 @api_router.get("/repairs")
@@ -689,9 +797,84 @@ async def get_repairs(payload: dict = Depends(verify_jwt_token)):
     """Get all repair requests (Admin only)"""
     repairs = await db.repair_submissions.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
     for rep in repairs:
+        rep.setdefault("status", "Pending")
+        rep.setdefault("admin_note", "")
         if isinstance(rep.get("created_at"), str):
             rep["created_at"] = datetime.fromisoformat(rep["created_at"]).isoformat()
+        if isinstance(rep.get("updated_at"), str):
+            rep["updated_at"] = datetime.fromisoformat(rep["updated_at"]).isoformat()
     return repairs
+
+
+@api_router.put("/repairs/{repair_id}/status")
+async def update_repair_status(
+    repair_id: str,
+    request: StatusUpdateRequest,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Update repair status/admin note (Admin only)"""
+    result = await db.repair_submissions.update_one(
+        {"id": repair_id},
+        {
+            "$set": {
+                "status": request.status,
+                "admin_note": request.admin_note or "",
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+        }
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Repair request not found")
+
+    return {"message": "Repair status updated successfully"}
+
+
+@api_router.put("/repairs/{repair_id}")
+async def update_repair(
+    repair_id: str,
+    updates: Dict[str, Any],
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Update full repair record (Admin only)"""
+    updates.pop("_id", None)
+    updates.pop("id", None)
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    result = await db.repair_submissions.update_one(
+        {"id": repair_id},
+        {"$set": updates}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Repair request not found")
+
+    return {"message": "Repair updated successfully"}
+
+
+@api_router.delete("/repairs/{repair_id}")
+async def delete_repair(
+    repair_id: str,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Delete repair request and its local uploaded images (Admin only)"""
+    repair = await db.repair_submissions.find_one({"id": repair_id})
+
+    if not repair:
+        raise HTTPException(status_code=404, detail="Repair request not found")
+
+    for image_url in repair.get("image_urls", []):
+        try:
+            filename = image_url.split("/")[-1]
+            file_path = ROOT_DIR / "uploads" / filename
+            if file_path.exists():
+                file_path.unlink()
+        except Exception as e:
+            logger.warning(f"Could not delete uploaded repair image: {str(e)}")
+
+    await db.repair_submissions.delete_one({"id": repair_id})
+
+    return {"message": "Repair deleted successfully"}
 
 # ==================== FILE UPLOAD ====================
 
@@ -719,6 +902,111 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"Error uploading file: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@api_router.get("/uploads/download/{filename}")
+async def download_uploaded_file(
+    filename: str,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Download uploaded file by filename (Admin only)"""
+    safe_filename = Path(filename).name
+    file_path = ROOT_DIR / "uploads" / safe_filename
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(
+        path=file_path,
+        filename=safe_filename,
+        media_type="application/octet-stream"
+    )
+
+
+# ==================== FORM FIELD BUILDER ROUTES ====================
+
+@api_router.get("/form-fields")
+async def get_form_fields(form_type: Optional[str] = None):
+    """Get dynamic form fields for enquiry/repair forms"""
+    query = {"active": True}
+    if form_type:
+        query["form_type"] = form_type
+
+    fields = await db.form_fields.find(query, {"_id": 0}).sort("sort_order", 1).to_list(1000)
+    return fields
+
+
+@api_router.get("/form-fields/admin")
+async def get_all_form_fields_admin(
+    form_type: Optional[str] = None,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Get all dynamic form fields, including inactive ones (Admin only)"""
+    query = {}
+    if form_type:
+        query["form_type"] = form_type
+
+    fields = await db.form_fields.find(query, {"_id": 0}).sort("sort_order", 1).to_list(1000)
+    return fields
+
+
+@api_router.post("/form-fields")
+async def create_form_field(
+    field: FormField,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Create dynamic form field (Admin only)"""
+    doc = field.model_dump()
+    doc["created_at"] = doc["created_at"].isoformat()
+    doc["updated_at"] = doc["updated_at"].isoformat()
+
+    await db.form_fields.insert_one(doc)
+    return {"message": "Form field created successfully", "id": field.id}
+
+
+@api_router.put("/form-fields/{field_id}")
+async def update_form_field(
+    field_id: str,
+    updates: Dict[str, Any],
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Update dynamic form field (Admin only)"""
+    updates.pop("_id", None)
+    updates.pop("id", None)
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    result = await db.form_fields.update_one(
+        {"id": field_id},
+        {"$set": updates}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Form field not found")
+
+    return {"message": "Form field updated successfully"}
+
+
+@api_router.delete("/form-fields/{field_id}")
+async def delete_form_field(
+    field_id: str,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Soft delete dynamic form field by making it inactive (Admin only)"""
+    result = await db.form_fields.update_one(
+        {"id": field_id},
+        {
+            "$set": {
+                "active": False,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+        }
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Form field not found")
+
+    return {"message": "Form field deleted successfully"}
 
 # ==================== PAGE CONTENT ROUTES ====================
 

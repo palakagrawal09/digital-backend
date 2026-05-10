@@ -323,11 +323,13 @@ async def send_email_otp(email: str, otp_code: str) -> bool:
 
         msg.attach(MIMEText(body, "html"))
 
-        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
-        server.starttls()
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.send_message(msg)
-        server.quit()
+      server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+server.ehlo()
+server.starttls()
+server.ehlo()
+server.login(SMTP_EMAIL, SMTP_PASSWORD)
+server.send_message(msg)
+server.quit()
 
         logger.info(f"OTP sent successfully to {email}")
         return True

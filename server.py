@@ -906,23 +906,17 @@ async def upload_file(file: UploadFile = File(...)):
 
 
 @api_router.get("/uploads/download/{filename}")
-async def download_uploaded_file(
-    filename: str,
-    payload: dict = Depends(verify_jwt_token)
-):
-    """Download uploaded file by filename (Admin only)"""
-    safe_filename = Path(filename).name
-    file_path = ROOT_DIR / "uploads" / safe_filename
+async def download_uploaded_file(filename: str):
+    file_path = ROOT_DIR / "uploads" / filename
 
-    if not file_path.exists() or not file_path.is_file():
+    if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
     return FileResponse(
         path=file_path,
-        filename=safe_filename,
+        filename=filename,
         media_type="application/octet-stream"
     )
-
 
 # ==================== FORM FIELD BUILDER ROUTES ====================
 

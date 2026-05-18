@@ -60,6 +60,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# In-memory OTP store for admin 2FA
+otp_store: dict = {}
+
 # ==================== MODELS ====================
 
 class HomePageContent(BaseModel):
@@ -743,7 +746,7 @@ async def delete_admin_user(admin_id: str, request: DeleteAdminRequest, payload:
     if target.get("role") == "super_admin":
         raise HTTPException(status_code=400, detail="Cannot delete super admin")
 
-    await db.admin_users.update_one({"id": admin_id}, {"": {"is_active": False}})
+    await db.admin_users.update_one({"id": admin_id}, {"$set": {"is_active": False}})
     send_ceo_acknowledgment("Admin Deleted", target["username"], payload["username"])
     return {"message": f"Admin '{target['username']}' deleted"}
 
@@ -769,7 +772,7 @@ async def change_password(request: ChangePasswordRequest, payload: dict = Depend
         raise HTTPException(status_code=401, detail="Current password incorrect")
     await db.admin_users.update_one(
         {"username": payload["username"]},
-        {"": {"password_hash": hash_password(request.new_password)}}
+        {"$set": {"password_hash": hash_password(request.new_password)}}
     )
     if payload.get("role") == "super_admin":
         send_ceo_acknowledgment("Password Changed", payload["username"], payload["username"])
@@ -787,7 +790,7 @@ async def change_username(request: ChangeUsernameRequest, payload: dict = Depend
         raise HTTPException(status_code=400, detail="Username already taken")
     await db.admin_users.update_one(
         {"username": payload["username"]},
-        {"": {"username": request.new_username}}
+        {"$set": {"username": request.new_username}}
     )
     return {"message": "Username changed successfully"}
 

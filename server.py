@@ -71,10 +71,40 @@ class HomePageContent(BaseModel):
 class AdminLoginRequest(BaseModel):
     username: str
     password: str
+    otp: Optional[str] = None
 
 class AdminLoginResponse(BaseModel):
     token: str
     message: str
+    role: str = "admin"
+    requires_otp: bool = False
+
+class AdminUser(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    username: str
+    password_hash: str
+    role: str = "admin"
+    email: Optional[str] = ""
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_by: str = "system"
+    is_active: bool = True
+
+class CreateAdminRequest(BaseModel):
+    username: str
+    password: str
+    email: Optional[str] = ""
+    otp: str
+
+class DeleteAdminRequest(BaseModel):
+    otp: str
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+class ChangeUsernameRequest(BaseModel):
+    new_username: str
+    current_password: str
 
 class OTPSendRequest(BaseModel):
     email: EmailStr
@@ -109,16 +139,16 @@ class AboutSection(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class EnquirySubmission(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="allow")
 
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str
     email: EmailStr
     phone: str
     organization: Optional[str] = ""
-    subject: str
-    product_interest: str
-    message: str
+    subject: Optional[str] = ""
+    product_interest: Optional[str] = ""
+    message: Optional[str] = ""
 
     status: str = "Pending"
     admin_note: str = ""
@@ -129,7 +159,7 @@ class EnquirySubmission(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class RepairSubmission(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="allow")
 
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
 
@@ -138,11 +168,11 @@ class RepairSubmission(BaseModel):
     phone: str
     organization: Optional[str] = ""
 
-    equipment_category: str
+    equipment_category: Optional[str] = ""
     equipment_variant: Optional[str] = ""
     serial_number: Optional[str] = ""
 
-    issue_description: str
+    issue_description: Optional[str] = ""
 
     image_urls: List[str] = []
 
@@ -482,9 +512,18 @@ def repair_team_email(repair):
 
 
 def create_jwt_token(username: str) -> str:
-    """Create JWT token"""
     payload = {
         "username": username,
+        "role": "admin",
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def create_jwt_token_with_role(username: str, role: str, admin_id: str) -> str:
+    payload = {
+        "username": username,
+        "role": role,
+        "admin_id": admin_id,
         "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -540,18 +579,217 @@ async def delete_home(id: str):
     return {"message": "deleted"}
 # ==================== ADMIN AUTH ROUTES ====================
 
+# ==================== ADMIN MANAGEMENT HELPERS ====================
+
+SUPER_ADMIN_USERNAME = os.environ.get("SUPER_ADMIN_USERNAME", "sunil_vyas")
+SUPER_ADMIN_PASSWORD = os.environ.get("SUPER_ADMIN_PASSWORD", "Sunil@123")
+CEO_EMAIL = os.environ.get("CEO_EMAIL", SMTP_EMAIL)
+
+def hash_password(password: str) -> str:
+    import hashlib
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_password(password: str, hashed: str) -> bool:
+    import hashlib
+    return hashlib.sha256(password.encode()).hexdigest() == hashed
+
+async def get_admin_by_username(username: str):
+    return await db.admin_users.find_one({"username": username, "is_active": True}, {"_id": 0})
+
+async def ensure_super_admin_exists():
+    existing = await db.admin_users.find_one({"username": SUPER_ADMIN_USERNAME})
+    if not existing:
+        doc = {
+            "id": str(uuid.uuid4()),
+            "username": SUPER_ADMIN_USERNAME,
+            "password_hash": hash_password(SUPER_ADMIN_PASSWORD),
+            "role": "super_admin",
+            "email": CEO_EMAIL,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_by": "system",
+            "is_active": True,
+        }
+        await db.admin_users.insert_one(doc)
+        logger.info(f"Super admin created: {SUPER_ADMIN_USERNAME}")
+
+def send_ceo_acknowledgment(action: str, target_username: str, performed_by: str):
+    subject = f"Admin Management Alert - {action}"
+    body = f"""
+    <html><body style="font-family:Arial,sans-serif;padding:20px;">
+    <h2 style="color:#1f3d31;">Admin Management Alert</h2>
+    <p>An admin management action was performed on the DIPL Website CMS.</p>
+    <table style="border-collapse:collapse;width:100%;max-width:500px;">
+      <tr><td style="padding:8px;border:1px solid #ddd;"><b>Action</b></td><td style="padding:8px;border:1px solid #ddd;">{action}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;"><b>Target Admin</b></td><td style="padding:8px;border:1px solid #ddd;">{target_username}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;"><b>Performed By</b></td><td style="padding:8px;border:1px solid #ddd;">{performed_by}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;"><b>Date & Time</b></td><td style="padding:8px;border:1px solid #ddd;">{datetime.now(timezone.utc).strftime("%d %b %Y, %I:%M %p UTC")}</td></tr>
+    </table>
+    <p style="color:#666;font-size:12px;margin-top:20px;">Digital Integrator Private Limited<br>46-A, Electronic Complex Pardeshipura, Indore, MP - 452001</p>
+    </body></html>
+    """
+    send_custom_email(CEO_EMAIL, subject, body)
+
+# ==================== ADMIN AUTH ROUTES ====================
+
 @api_router.post("/admin/login", response_model=AdminLoginResponse)
 async def admin_login(request: AdminLoginRequest):
-    """Admin login endpoint"""
+    """Admin login - super admin gets 2FA OTP first"""
+    await ensure_super_admin_exists()
+
+    # Check DB first
+    admin = await get_admin_by_username(request.username)
+
+    if admin:
+        if not verify_password(request.password, admin["password_hash"]):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        # Super admin needs 2FA
+        if admin["role"] == "super_admin":
+            if not request.otp:
+                # Send OTP to CEO email
+                otp_code = str(random.randint(100000, 999999))
+                otp_store[admin.get("email", CEO_EMAIL)] = {
+                    "otp": otp_code,
+                    "expires": datetime.now(timezone.utc) + timedelta(minutes=10),
+                    "used": False,
+                }
+                await send_email_otp(admin.get("email", CEO_EMAIL), otp_code)
+                return AdminLoginResponse(token="", message="OTP sent to CEO email", role="super_admin", requires_otp=True)
+
+            # Verify OTP
+            ceo_email = admin.get("email", CEO_EMAIL)
+            stored = otp_store.get(ceo_email)
+            if not stored or stored["otp"] != request.otp or stored["used"]:
+                raise HTTPException(status_code=401, detail="Invalid or expired OTP")
+            if datetime.now(timezone.utc) > stored["expires"]:
+                raise HTTPException(status_code=401, detail="OTP expired")
+            stored["used"] = True
+
+        token = create_jwt_token(request.username)
+        payload_extra = {"role": admin["role"], "admin_id": admin["id"]}
+        token = create_jwt_token_with_role(request.username, admin["role"], admin["id"])
+        return AdminLoginResponse(token=token, message="Login successful", role=admin["role"])
+
+    # Fallback: env-based admin (backward compat)
     if request.username == ADMIN_USERNAME and request.password == ADMIN_PASSWORD:
         token = create_jwt_token(request.username)
-        return AdminLoginResponse(token=token, message="Login successful")
+        return AdminLoginResponse(token=token, message="Login successful", role="admin")
+
     raise HTTPException(status_code=401, detail="Invalid credentials")
 
 @api_router.get("/admin/verify")
 async def verify_admin(payload: dict = Depends(verify_jwt_token)):
-    """Verify admin token"""
-    return {"valid": True, "username": payload['username']}
+    return {"valid": True, "username": payload["username"], "role": payload.get("role", "admin")}
+
+# ==================== SUPER ADMIN MANAGEMENT ROUTES ====================
+
+@api_router.get("/admin/users")
+async def list_admin_users(payload: dict = Depends(verify_jwt_token)):
+    if payload.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Super admin access required")
+    users = await db.admin_users.find({}, {"_id": 0, "password_hash": 0}).sort("created_at", 1).to_list(100)
+    return users
+
+@api_router.post("/admin/users")
+async def create_admin_user(request: CreateAdminRequest, payload: dict = Depends(verify_jwt_token)):
+    if payload.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Super admin access required")
+
+    # Verify OTP
+    ceo_email = CEO_EMAIL
+    stored = otp_store.get(ceo_email)
+    if not stored or stored["otp"] != request.otp or stored["used"]:
+        raise HTTPException(status_code=401, detail="Invalid or expired OTP")
+    if datetime.now(timezone.utc) > stored["expires"]:
+        raise HTTPException(status_code=401, detail="OTP expired")
+    stored["used"] = True
+
+    existing = await db.admin_users.find_one({"username": request.username})
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "username": request.username,
+        "password_hash": hash_password(request.password),
+        "role": "admin",
+        "email": request.email or "",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_by": payload["username"],
+        "is_active": True,
+    }
+    await db.admin_users.insert_one(doc)
+
+    send_ceo_acknowledgment("New Admin Created", request.username, payload["username"])
+    return {"message": f"Admin '{request.username}' created successfully"}
+
+@api_router.delete("/admin/users/{admin_id}")
+async def delete_admin_user(admin_id: str, request: DeleteAdminRequest, payload: dict = Depends(verify_jwt_token)):
+    if payload.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Super admin access required")
+
+    # Verify OTP
+    ceo_email = CEO_EMAIL
+    stored = otp_store.get(ceo_email)
+    if not stored or stored["otp"] != request.otp or stored["used"]:
+        raise HTTPException(status_code=401, detail="Invalid or expired OTP")
+    if datetime.now(timezone.utc) > stored["expires"]:
+        raise HTTPException(status_code=401, detail="OTP expired")
+    stored["used"] = True
+
+    target = await db.admin_users.find_one({"id": admin_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Admin not found")
+    if target.get("role") == "super_admin":
+        raise HTTPException(status_code=400, detail="Cannot delete super admin")
+
+    await db.admin_users.update_one({"id": admin_id}, {"": {"is_active": False}})
+    send_ceo_acknowledgment("Admin Deleted", target["username"], payload["username"])
+    return {"message": f"Admin '{target['username']}' deleted"}
+
+@api_router.post("/admin/send-management-otp")
+async def send_management_otp(payload: dict = Depends(verify_jwt_token)):
+    if payload.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Super admin access required")
+    otp_code = str(random.randint(100000, 999999))
+    otp_store[CEO_EMAIL] = {
+        "otp": otp_code,
+        "expires": datetime.now(timezone.utc) + timedelta(minutes=10),
+        "used": False,
+    }
+    await send_email_otp(CEO_EMAIL, otp_code)
+    return {"message": "OTP sent to CEO email"}
+
+@api_router.put("/admin/change-password")
+async def change_password(request: ChangePasswordRequest, payload: dict = Depends(verify_jwt_token)):
+    admin = await get_admin_by_username(payload["username"])
+    if not admin:
+        raise HTTPException(status_code=404, detail="Admin not found")
+    if not verify_password(request.current_password, admin["password_hash"]):
+        raise HTTPException(status_code=401, detail="Current password incorrect")
+    await db.admin_users.update_one(
+        {"username": payload["username"]},
+        {"": {"password_hash": hash_password(request.new_password)}}
+    )
+    if payload.get("role") == "super_admin":
+        send_ceo_acknowledgment("Password Changed", payload["username"], payload["username"])
+    return {"message": "Password changed successfully"}
+
+@api_router.put("/admin/change-username")
+async def change_username(request: ChangeUsernameRequest, payload: dict = Depends(verify_jwt_token)):
+    admin = await get_admin_by_username(payload["username"])
+    if not admin:
+        raise HTTPException(status_code=404, detail="Admin not found")
+    if not verify_password(request.current_password, admin["password_hash"]):
+        raise HTTPException(status_code=401, detail="Current password incorrect")
+    existing = await db.admin_users.find_one({"username": request.new_username})
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already taken")
+    await db.admin_users.update_one(
+        {"username": payload["username"]},
+        {"": {"username": request.new_username}}
+    )
+    return {"message": "Username changed successfully"}
 
 
 # ==================== OTP ROUTES ====================
@@ -740,7 +978,7 @@ async def update_enquiry_status(
 ):
     """Update enquiry status/admin note (Admin only)"""
     result = await db.contact_submissions.update_one(
-        {"id": enquiry_id},
+        {"$or": [{"id": enquiry_id}, {"_id": enquiry_id}]},
         {
             "$set": {
                 "status": request.status,
@@ -814,7 +1052,7 @@ async def update_repair_status(
 ):
     """Update repair status/admin note (Admin only)"""
     result = await db.repair_submissions.update_one(
-        {"id": repair_id},
+        {"$or": [{"id": repair_id}, {"_id": repair_id}]},
         {
             "$set": {
                 "status": request.status,

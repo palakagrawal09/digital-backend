@@ -31,7 +31,7 @@ db = client[os.environ['DB_NAME']]
 # JWT Configuration
 JWT_SECRET = os.environ.get('JWT_SECRET', 'your-secret-key')
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRATION_HOURS = 24
+JWT_EXPIRATION_HOURS = 168  # 7 days
 
 # Admin Credentials
 ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
@@ -60,8 +60,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# In-memory OTP store for admin 2FA
-otp_store: dict = {}
+# Admin OTP is stored in MongoDB (not in-memory) to support multi-worker deployments
 
 # ==================== MODELS ====================
 
@@ -230,6 +229,7 @@ class Product(BaseModel):
     description: str = ""
     specifications: str = ""
     images: List[str] = []
+    videos: List[str] = []
     published: bool = True
     sort_order: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -259,6 +259,10 @@ class Client(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str
     logo_url: str = ""
+    description: str = ""
+    short_description: str = ""
+    website_url: str = ""
+    category: str = ""
     published: bool = True
     sort_order: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -651,22 +655,24 @@ async def admin_login(request: AdminLoginRequest):
             if not request.otp:
                 # Send OTP to CEO email
                 otp_code = str(random.randint(100000, 999999))
-                otp_store[admin.get("email", CEO_EMAIL)] = {
+                await db.admin_otp.delete_many({"email": admin.get("email", CEO_EMAIL)})
+                await db.admin_otp.insert_one({
+                    "email": admin.get("email", CEO_EMAIL),
                     "otp": otp_code,
-                    "expires": datetime.now(timezone.utc) + timedelta(minutes=10),
+                    "expires": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
                     "used": False,
-                }
+                })
                 await send_email_otp(admin.get("email", CEO_EMAIL), otp_code)
                 return AdminLoginResponse(token="", message="OTP sent to CEO email", role="super_admin", requires_otp=True)
 
-            # Verify OTP
+            # Verify OTP from MongoDB
             ceo_email = admin.get("email", CEO_EMAIL)
-            stored = otp_store.get(ceo_email)
-            if not stored or stored["otp"] != request.otp or stored["used"]:
+            stored = await db.admin_otp.find_one({"email": ceo_email, "used": False})
+            if not stored or stored["otp"] != request.otp:
                 raise HTTPException(status_code=401, detail="Invalid or expired OTP")
-            if datetime.now(timezone.utc) > stored["expires"]:
+            if datetime.now(timezone.utc) > datetime.fromisoformat(stored["expires"]):
                 raise HTTPException(status_code=401, detail="OTP expired")
-            stored["used"] = True
+            await db.admin_otp.update_one({"_id": stored["_id"]}, {"$set": {"used": True}})
 
         token = create_jwt_token(request.username)
         payload_extra = {"role": admin["role"], "admin_id": admin["id"]}
@@ -698,14 +704,13 @@ async def create_admin_user(request: CreateAdminRequest, payload: dict = Depends
     if payload.get("role") != "super_admin":
         raise HTTPException(status_code=403, detail="Super admin access required")
 
-    # Verify OTP
-    ceo_email = CEO_EMAIL
-    stored = otp_store.get(ceo_email)
-    if not stored or stored["otp"] != request.otp or stored["used"]:
+    # Verify OTP from MongoDB
+    stored = await db.admin_otp.find_one({"email": CEO_EMAIL, "used": False})
+    if not stored or stored["otp"] != request.otp:
         raise HTTPException(status_code=401, detail="Invalid or expired OTP")
-    if datetime.now(timezone.utc) > stored["expires"]:
+    if datetime.now(timezone.utc) > datetime.fromisoformat(stored["expires"]):
         raise HTTPException(status_code=401, detail="OTP expired")
-    stored["used"] = True
+    await db.admin_otp.update_one({"_id": stored["_id"]}, {"$set": {"used": True}})
 
     existing = await db.admin_users.find_one({"username": request.username})
     if existing:
@@ -731,14 +736,13 @@ async def delete_admin_user(admin_id: str, request: DeleteAdminRequest, payload:
     if payload.get("role") != "super_admin":
         raise HTTPException(status_code=403, detail="Super admin access required")
 
-    # Verify OTP
-    ceo_email = CEO_EMAIL
-    stored = otp_store.get(ceo_email)
-    if not stored or stored["otp"] != request.otp or stored["used"]:
+    # Verify OTP from MongoDB
+    stored = await db.admin_otp.find_one({"email": CEO_EMAIL, "used": False})
+    if not stored or stored["otp"] != request.otp:
         raise HTTPException(status_code=401, detail="Invalid or expired OTP")
-    if datetime.now(timezone.utc) > stored["expires"]:
+    if datetime.now(timezone.utc) > datetime.fromisoformat(stored["expires"]):
         raise HTTPException(status_code=401, detail="OTP expired")
-    stored["used"] = True
+    await db.admin_otp.update_one({"_id": stored["_id"]}, {"$set": {"used": True}})
 
     target = await db.admin_users.find_one({"id": admin_id}, {"_id": 0})
     if not target:
@@ -755,11 +759,13 @@ async def send_management_otp(payload: dict = Depends(verify_jwt_token)):
     if payload.get("role") != "super_admin":
         raise HTTPException(status_code=403, detail="Super admin access required")
     otp_code = str(random.randint(100000, 999999))
-    otp_store[CEO_EMAIL] = {
+    await db.admin_otp.delete_many({"email": CEO_EMAIL})
+    await db.admin_otp.insert_one({
+        "email": CEO_EMAIL,
         "otp": otp_code,
-        "expires": datetime.now(timezone.utc) + timedelta(minutes=10),
+        "expires": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
         "used": False,
-    }
+    })
     await send_email_otp(CEO_EMAIL, otp_code)
     return {"message": "OTP sent to CEO email"}
 

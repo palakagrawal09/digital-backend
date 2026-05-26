@@ -12,6 +12,12 @@ import uuid
 from datetime import datetime, timezone, timedelta
 import jwt
 import smtplib
+try:
+    import cloudinary
+    import cloudinary.uploader
+    CLOUDINARY_AVAILABLE = True
+except ImportError:
+    CLOUDINARY_AVAILABLE = False
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import random
@@ -39,6 +45,20 @@ ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
 
 # Email Configuration
 USE_SIMULATED_OTP = os.environ.get('USE_SIMULATED_OTP', 'true').lower() == 'true'
+
+# Cloudinary config
+CLOUDINARY_CLOUD_NAME = os.environ.get('CLOUDINARY_CLOUD_NAME', '')
+CLOUDINARY_API_KEY    = os.environ.get('CLOUDINARY_API_KEY', '')
+CLOUDINARY_API_SECRET = os.environ.get('CLOUDINARY_API_SECRET', '')
+USE_CLOUDINARY = bool(CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET and CLOUDINARY_AVAILABLE)
+
+if USE_CLOUDINARY:
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD_NAME,
+        api_key=CLOUDINARY_API_KEY,
+        api_secret=CLOUDINARY_API_SECRET,
+        secure=True
+    )
 SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
 SMTP_PORT = int(os.environ.get('SMTP_PORT', 587))
 SMTP_EMAIL = os.environ.get('SMTP_EMAIL')
@@ -363,8 +383,16 @@ def generate_otp() -> str:
 
 async def send_email_async(to_email: str, subject: str, html_content: str) -> bool:
     """Generic email sender for status updates"""
-    if not SMTP_EMAIL or not SMTP_PASSWORD:
-        logger.info(f"[SIMULATED EMAIL] To: {to_email} | Subject: {subject}")
+    if USE_SIMULATED_OTP or not SMTP_EMAIL or not SMTP_PASSWORD:
+        # Strip HTML tags for readable log
+        import re
+        text = re.sub(r'<[^>]+>', '', html_content)
+        text = re.sub(r'\s+', ' ', text).strip()
+        logger.info(f"📧 ========== SIMULATED STATUS EMAIL ==========")
+        logger.info(f"   To      : {to_email}")
+        logger.info(f"   Subject : {subject}")
+        logger.info(f"   Content : {text[:500]}")
+        logger.info(f"📧 =============================================")
         return True
     try:
         import asyncio
@@ -1297,27 +1325,51 @@ async def delete_repair(
 
 @api_router.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """Upload file (images for repair forms)"""
+    """Upload file — uses Cloudinary if configured, else local storage"""
     try:
-        # Create uploads directory if not exists
-        upload_dir = ROOT_DIR/"uploads"
+        file_contents = await file.read()
+        file_ext = Path(file.filename or "file").suffix.lower()
+
+        # ── Cloudinary upload ──────────────────────────────────────────
+        if USE_CLOUDINARY:
+            import io
+            result = cloudinary.uploader.upload(
+                io.BytesIO(file_contents),
+                folder="dipl_cms",
+                resource_type="auto",
+                use_filename=False,
+                unique_filename=True,
+            )
+            file_url  = result.get("secure_url", "")
+            file_path = result.get("public_id", "")
+            logger.info(f"Cloudinary upload success: {file_url}")
+            return {
+                "url":       file_url,
+                "file_path": file_url,
+                "file_url":  file_url,
+                "filename":  file_path,
+                "storage":   "cloudinary"
+            }
+
+        # ── Local fallback ─────────────────────────────────────────────
+        upload_dir = ROOT_DIR / "uploads"
         upload_dir.mkdir(exist_ok=True)
-        
-        # Generate unique filename
-        file_ext = Path(file.filename).suffix
-        filename = f"{uuid.uuid4()}{file_ext}"
+        filename  = f"{uuid.uuid4()}{file_ext}"
         file_path = upload_dir / filename
-        
-        # Save file
         with file_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        # Return file URL
+            buffer.write(file_contents)
         file_url = f"/uploads/{filename}"
-        return {"url": file_url, "filename": filename}
-    
+        logger.info(f"Local upload: {file_url}")
+        return {
+            "url":       file_url,
+            "file_path": file_url,
+            "file_url":  file_url,
+            "filename":  filename,
+            "storage":   "local"
+        }
+
     except Exception as e:
-        logger.error(f"Error uploading file: {str(e)}")
+        logger.error(f"Upload error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

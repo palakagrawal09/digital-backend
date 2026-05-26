@@ -1,387 +1,1923 @@
-import Header from "@/components/Header";
-import Footer from "@/components/Footer";
-import { MonitorPlay, Shield, ChevronRight, ChevronLeft, ChevronLeft, Play, X, Download, Mail, Loader2, ZoomIn, Cpu } from "lucide-react";
-import { Link, useLocation } from "react-router-dom";
-import { useEffect, useMemo, useRef, useState } from "react";
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Form
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field, ConfigDict, EmailStr
+from typing import List, Optional, Dict, Any
+import uuid
+from datetime import datetime, timezone, timedelta
+import jwt
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import random
+import string
+import shutil
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
-const API_BASE_URL = process.env.REACT_APP_BACKEND_URL || "http://localhost:8000";
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
 
-const formatImagePath = (img) => {
-  if (!img || String(img).trim() === "") return null;
-  const v = String(img).trim();
-  if (v.startsWith("http") || v.startsWith("data:") || v.startsWith("blob:")) return v;
-  if (v.startsWith("/assets/")) return v;
-  if (v.startsWith("/uploads/")) return `${API_BASE_URL}${v}`;
-  if (v.startsWith("uploads/")) return `${API_BASE_URL}/${v}`;
-  if (!v.includes("/")) return `${API_BASE_URL}/uploads/${v}`;
-  return `${API_BASE_URL}/${v.replace(/^\/+/, "")}`;
-};
+# MongoDB connection
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
 
-const getYoutubeId = (url) => { const m = url.match(/(?:v=|youtu\.be\/)([^&?/]+)/); return m ? m[1] : null; };
-const getEmbedUrl = (url) => {
-  if (url.includes("youtube") || url.includes("youtu.be")) { const id = getYoutubeId(url); return id ? `https://www.youtube.com/embed/${id}?autoplay=1` : url; }
-  if (url.includes("vimeo")) { const m = url.match(/vimeo\.com\/(\d+)/); return m ? `https://player.vimeo.com/video/${m[1]}?autoplay=1` : url; }
-  return null;
-};
+# JWT Configuration
+JWT_SECRET = os.environ.get('JWT_SECRET', 'your-secret-key')
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 168  # 7 days
 
-const Reveal = ({ children, delay = 0 }) => {
-  const ref = useRef(null);
-  const [visible, setVisible] = useState(false);
-  useEffect(() => {
-    const el = ref.current; if (!el) return;
-    const obs = new IntersectionObserver(([e]) => { if (e.isIntersecting) { setVisible(true); obs.disconnect(); } }, { threshold: 0.1 });
-    obs.observe(el); return () => obs.disconnect();
-  }, []);
-  return (
-    <div ref={ref} className={`transition-all duration-700 ease-out ${visible ? "opacity-100 translate-y-0" : "opacity-0 translate-y-8"}`} style={{ transitionDelay: `${delay}ms` }}>
-      {children}
-    </div>
-  );
-};
+# Admin Credentials
+ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
 
-const VideoModal = ({ url, onClose }) => {
-  const embedUrl = getEmbedUrl(url);
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm" onClick={onClose}>
-      <div className="relative w-full max-w-4xl mx-4" onClick={(e) => e.stopPropagation()}>
-        <button onClick={onClose} className="absolute -top-10 right-0 text-white hover:text-[#c8a45d] flex items-center gap-2 text-sm"><X className="w-5 h-5" /> Close</button>
-        {embedUrl ? (
-          <iframe src={embedUrl} className="w-full aspect-video rounded-xl shadow-2xl" allow="autoplay; fullscreen" allowFullScreen title="Simulator Video" />
-        ) : (
-          <video src={formatImagePath(url)} controls autoPlay className="w-full aspect-video rounded-xl shadow-2xl" />
-        )}
-      </div>
-    </div>
-  );
-};
+# Email Configuration
+USE_SIMULATED_OTP = os.environ.get('USE_SIMULATED_OTP', 'true').lower() == 'true'
+SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', 587))
+SMTP_EMAIL = os.environ.get('SMTP_EMAIL')
+SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD')
 
-const Lightbox = ({ images, index, onClose }) => {
-  const [current, setCurrent] = useState(index);
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-sm" onClick={onClose}>
-      <div className="relative max-w-5xl w-full mx-4" onClick={(e) => e.stopPropagation()}>
-        <button onClick={onClose} className="absolute -top-10 right-0 text-white hover:text-[#c8a45d] flex items-center gap-2 text-sm"><X className="w-5 h-5" /> Close</button>
-        <img src={formatImagePath(images[current])} alt="" className="w-full max-h-[80vh] object-contain rounded-xl" />
-        {images.length > 1 && (
-          <div className="flex justify-center gap-2 mt-4">
-            {images.map((_, i) => (
-              <button key={i} onClick={() => setCurrent(i)} className={`w-2.5 h-2.5 rounded-full transition-all ${i === current ? "bg-[#c8a45d] scale-125" : "bg-white/40"}`} />
-            ))}
+# Create the main app
+app = FastAPI()
+api_router = APIRouter(prefix="/api")
+security = HTTPBearer()
+
+uploads_dir = Path("uploads")
+uploads_dir.mkdir(exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Admin OTP is stored in MongoDB (not in-memory) to support multi-worker deployments
+
+# ==================== MODELS ====================
+
+class HomePageContent(BaseModel):
+    id: Optional[str] = None
+    section: str
+    content: dict
+    published: bool = True
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+    otp: Optional[str] = None
+
+class AdminLoginResponse(BaseModel):
+    token: str
+    message: str
+    role: str = "admin"
+    requires_otp: bool = False
+
+class AdminUser(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    username: str
+    password_hash: str
+    role: str = "admin"
+    email: Optional[str] = ""
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_by: str = "system"
+    is_active: bool = True
+
+class CreateAdminRequest(BaseModel):
+    username: str
+    password: str
+    email: Optional[str] = ""
+    otp: str
+
+class DeleteAdminRequest(BaseModel):
+    otp: str
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+class ChangeUsernameRequest(BaseModel):
+    new_username: str
+    current_password: str
+
+class OTPSendRequest(BaseModel):
+    email: EmailStr
+    form_type: str = "enquiry"
+
+class OTPVerifyRequest(BaseModel):
+    email: EmailStr
+    otp_code: str
+
+class AboutCategory(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    slug: str = ""
+    description: str = ""
+    sort_order: int = 0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class AboutSection(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    title: str
+    category_id: str
+    description: str = ""
+    image_url: str = ""
+    designation: str = ""
+    published: bool = True
+    sort_order: int = 0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class EnquirySubmission(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    email: EmailStr
+    phone: str
+    organization: Optional[str] = ""
+    subject: Optional[str] = ""
+    product_interest: Optional[str] = ""
+    message: Optional[str] = ""
+
+    status: str = "Pending"
+    admin_note: str = ""
+
+    read: bool = False
+
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class RepairSubmission(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+
+    name: str
+    email: EmailStr
+    phone: str
+    organization: Optional[str] = ""
+
+    equipment_category: Optional[str] = ""
+    equipment_variant: Optional[str] = ""
+    serial_number: Optional[str] = ""
+
+    issue_description: Optional[str] = ""
+
+    image_urls: List[str] = []
+
+    status: str = "Pending"
+    admin_note: str = ""
+
+    read: bool = False
+
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class StatusUpdateRequest(BaseModel):
+    status: str
+    admin_note: Optional[str] = ""
+
+
+class FormField(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    form_type: str  # enquiry or repair
+    section: str = "Main"
+    label: str
+    field_key: str
+    field_type: str = "text"  # text, email, phone, textarea, select, file
+    placeholder: str = ""
+    required: bool = True
+    options: List[str] = []
+    sort_order: int = 0
+    active: bool = True
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class PageContent(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    page: str
+    section: str
+    content_key: str
+    content_value: str = ""
+    published: bool = True
+    sort_order: int = 0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class Product(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    category_id: str
+    description: str = ""
+    specifications: str = ""
+    images: List[str] = []
+    videos: List[str] = []
+    published: bool = True
+    sort_order: int = 0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class ProductCategory(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    icon: str = ""
+    sort_order: int = 0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class Service(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    title: str
+    description: str = ""
+    published: bool = True
+    sort_order: int = 0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class Client(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    logo_url: str = ""
+    description: str = ""
+    short_description: str = ""
+    website_url: str = ""
+    category: str = ""
+    published: bool = True
+    sort_order: int = 0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class NewsArticle(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    title: str
+    content: str = ""
+    image_url: str = ""
+    published: bool = True
+    published_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class Employee(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    designation: str = ""
+    department: str = ""
+    email: str = ""
+    phone: str = ""
+    status: str = "active"
+    join_date: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class OfficeInfo(BaseModel):
+    title: str
+    address_line_1: str
+    address_line_2: str
+    address_line_3: str
+
+
+class StatutoryInfo(BaseModel):
+    cin: str
+    gst_no: str
+    registration_no: str
+    roc: str
+
+
+class CTAInfo(BaseModel):
+    title: str
+    description: str
+    button_text: str
+
+
+class ContactPageSchema(BaseModel):
+    registered_office: OfficeInfo
+    corporate_office: OfficeInfo
+    email: str
+    phone: str
+    statutory_info: StatutoryInfo
+    map_embed_url: str
+    cta: CTAInfo
+    certifications: List[str] = []
+default_contact_data = {
+    "registered_office": {
+        "title": "Registered Office",
+        "address_line_1": "46 Electronic Complex",
+        "address_line_2": "Pardeshipura, Indore",
+        "address_line_3": "Madhya Pradesh - 452010, India"
+    },
+    "corporate_office": {
+        "title": "Corporate Office",
+        "address_line_1": "46 Electronic Complex",
+        "address_line_2": "Pardeshipura, Indore",
+        "address_line_3": "Madhya Pradesh - 452010, India"
+    },
+    "email": "info@diplindia.com",
+    "phone": "+91-731-4255200",
+    "statutory_info": {
+        "cin": "U31909MP1997PTC012011",
+        "gst_no": "23AAACD9928P1Z5",
+        "registration_no": "12011",
+        "roc": "Gwalior"
+    },
+    "map_embed_url": "https://www.google.com/maps/embed?pb=...",
+    "cta": {
+        "title": "Need Assistance?",
+        "description": "For product enquiries, support requirements, or repair requests, please use our dedicated submission form.",
+        "button_text": "Submit Enquiry / Repair Request"
+    },
+    "certifications": ["ISO 9001:2015", "Defence Grade", "GeM Registered"]
+}
+
+
+
+
+# ==================== HELPER FUNCTIONS ====================
+
+def generate_otp() -> str:
+    """Generate 6-digit OTP"""
+    return "".join(random.choices(string.digits, k=6))
+
+
+async def send_email_async(to_email: str, subject: str, html_content: str) -> bool:
+    """Generic email sender for status updates"""
+    if not SMTP_EMAIL or not SMTP_PASSWORD:
+        logger.info(f"[SIMULATED EMAIL] To: {to_email} | Subject: {subject}")
+        return True
+    try:
+        import asyncio
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = SMTP_EMAIL
+        msg["To"]      = to_email
+        msg.attach(MIMEText(html_content, "html"))
+        loop = asyncio.get_event_loop()
+        def _send():
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+                server.ehlo()
+                server.starttls()
+                server.login(SMTP_EMAIL, SMTP_PASSWORD)
+                server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
+        await loop.run_in_executor(None, _send)
+        return True
+    except Exception as e:
+        logger.error(f"Email send failed: {e}")
+        return False
+
+
+async def send_email_otp(email: str, otp_code: str) -> bool:
+    """
+    Development-safe OTP sender.
+    - If USE_SIMULATED_OTP = true, OTP terminal me print hoga
+    - Otherwise SMTP use hoga
+    """
+    try:
+        if USE_SIMULATED_OTP:
+            logger.info("=" * 80)
+            logger.info("📧 SIMULATED OTP EMAIL")
+            logger.info(f"To: {email}")
+            logger.info(f"OTP Code: {otp_code}")
+            logger.info("This code will expire in 10 minutes")
+            logger.info("=" * 80)
+            print(f"\n🔐 OTP for {email}: {otp_code}\n")
+            return True
+
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = email
+        msg["Subject"] = "Email Verification - Digital Integrator Pvt Ltd"
+
+        body = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; padding: 20px;">
+                <h2 style="color: #1a1a1a;">Email Verification Code</h2>
+                <p>Your verification code is:</p>
+                <h1 style="color: #D4AF37; font-size: 32px; letter-spacing: 5px;">{otp_code}</h1>
+                <p>This code will expire in 10 minutes.</p>
+                <p>If you didn't request this code, please ignore this email.</p>
+                <hr>
+                <p style="color: #666; font-size: 12px;">
+                    Digital Integrator Private Limited<br>
+                    46-A, Electronic Complex Pardeshipura, Indore, MP - 452001
+                </p>
+            </body>
+        </html>
+        """
+
+        msg.attach(MIMEText(body, "html"))
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.send_message(msg)
+
+        logger.info(f"OTP sent successfully to {email}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to send OTP email to {email}: {str(e)}")
+        return False
+
+
+def send_custom_email(to_email: str, subject: str, html_body: str) -> bool:
+    """
+    For acknowledgement / team notification emails.
+    Failure ko caller handle karega.
+    """
+    try:
+        if USE_SIMULATED_OTP:
+            logger.info("=" * 80)
+            logger.info("📧 SIMULATED CUSTOM EMAIL")
+            logger.info(f"To: {to_email}")
+            logger.info(f"Subject: {subject}")
+            logger.info("Email body generated successfully")
+            logger.info("=" * 80)
+            print(f"\n📨 Simulated email to {to_email}\nSubject: {subject}\n")
+            return True
+
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(html_body, "html"))
+
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+
+        logger.info(f"Email sent to {to_email}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to send email to {to_email}: {str(e)}")
+        return False
+
+
+def enquiry_ack_email(enquiry):
+    return f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6;">
+        <h2>Thank you for contacting us</h2>
+        <p>Dear {enquiry.name},</p>
+        <p>Your enquiry has been received successfully.</p>
+        <p>We will get back to you shortly.</p>
+        <br />
+        <p><b>Digital Integrator Pvt Ltd</b></p>
+      </body>
+    </html>
+    """
+
+
+def enquiry_team_email(enquiry):
+    return f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6;">
+        <h2>New Enquiry Received</h2>
+        <p><b>Name:</b> {enquiry.name}</p>
+        <p><b>Email:</b> {enquiry.email}</p>
+        <p><b>Phone:</b> {enquiry.phone}</p>
+        <p><b>Organization:</b> {enquiry.organization}</p>
+        <p><b>Subject:</b> {enquiry.subject}</p>
+        <p><b>Product:</b> {enquiry.product_interest}</p>
+        <p><b>Message:</b><br>{enquiry.message}</p>
+      </body>
+    </html>
+    """
+
+
+def repair_ack_email(repair):
+    return f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6;">
+        <h2>Repair Request Received</h2>
+        <p>Dear {repair.name},</p>
+        <p>Your repair request has been received successfully.</p>
+        <p>Our team will review it and contact you shortly.</p>
+        <br />
+        <p><b>Digital Integrator Pvt Ltd</b></p>
+      </body>
+    </html>
+    """
+
+
+def repair_team_email(repair):
+    return f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6;">
+        <h2>New Repair Request Received</h2>
+        <p><b>Name:</b> {repair.name}</p>
+        <p><b>Email:</b> {repair.email}</p>
+        <p><b>Phone:</b> {repair.phone}</p>
+        <p><b>Organization:</b> {repair.organization}</p>
+        <p><b>Equipment Category:</b> {repair.equipment_category}</p>
+        <p><b>Equipment Variant:</b> {repair.equipment_variant}</p>
+        <p><b>Serial Number:</b> {repair.serial_number}</p>
+        <p><b>Issue:</b><br>{repair.issue_description}</p>
+      </body>
+    </html>
+    """
+
+
+# ── Status Update Email Templates ──────────────────────────────────────────
+
+def enquiry_status_email(name: str, status: str, admin_note: str, ref_id: str) -> str:
+    status_colors = {
+        "pending":     "#f59e0b",
+        "in_progress": "#3b82f6",
+        "resolved":    "#10b981",
+        "rejected":    "#ef4444",
+        "completed":   "#10b981",
+    }
+    color = status_colors.get(status.lower(), "#1f3d31")
+    status_label = status.replace("_", " ").title()
+
+    return f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; background:#f8f7f2; margin:0; padding:0;">
+      <div style="max-width:600px; margin:30px auto; background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+        <div style="background:#1f3d31; padding:24px 32px;">
+          <h1 style="color:#c8a45d; margin:0; font-size:22px;">Digital Integrator Pvt. Ltd.</h1>
+          <p style="color:#ffffff99; margin:6px 0 0; font-size:13px;">Enquiry Status Update</p>
+        </div>
+        <div style="padding:32px;">
+          <p style="color:#333; font-size:15px;">Dear <b>{name}</b>,</p>
+          <p style="color:#555; font-size:14px; line-height:1.6;">
+            Your enquiry (Ref: <b>{ref_id[:8].upper()}</b>) status has been updated.
+          </p>
+          <div style="background:#f8f7f2; border-left:4px solid {color}; padding:16px 20px; margin:20px 0; border-radius:4px;">
+            <p style="margin:0; font-size:13px; color:#666; text-transform:uppercase; letter-spacing:1px;">Current Status</p>
+            <p style="margin:6px 0 0; font-size:20px; font-weight:bold; color:{color};">{status_label}</p>
           </div>
-        )}
-      </div>
-    </div>
-  );
-};
-
-const SimulatorCard = ({ item, reverse = false }) => {
-  const [activeTab, setActiveTab] = useState("overview");
-  const [videoModal, setVideoModal] = useState(null);
-  const [lightbox, setLightbox] = useState(null);
-  const [mainImage, setMainImage] = useState(0);
-
-  const images = useMemo(() => {
-    const raw = Array.isArray(item.images) && item.images.filter(Boolean).length > 0
-      ? item.images.filter(Boolean)
-      : item.image_url ? [item.image_url] : item.image ? [item.image] : [];
-    return raw.map(formatImagePath).filter(Boolean);
-  }, [item]);
-
-  const videos = useMemo(() => (Array.isArray(item.videos) ? item.videos.filter(Boolean) : []), [item]);
-
-  const specs = useMemo(() => {
-    if (!item.specifications) return [];
-    return item.specifications.split(/\n|(?=[•●▪◦])/).map(l => l.trim().replace(/^[•●▪◦\-]\s*/, "")).filter(Boolean);
-  }, [item]);
-
-  const tabs = [
-    { id: "overview", label: "Overview" },
-    { id: "specs", label: "Specifications" },
-    ...(videos.length > 0 ? [{ id: "demo", label: "Demo Video" }] : []),
-  ];
-
-  return (
-    <article className="bg-white border border-gray-100 shadow-sm hover:shadow-lg transition-shadow duration-300 overflow-hidden mb-1">
-
-      {/* Header */}
-      <div className="bg-gradient-to-r from-[#0d1f2d] to-[#1a3347] px-6 sm:px-10 py-6">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div>
-            <h3 className="text-xl sm:text-2xl font-bold text-white leading-tight">{item.name}</h3>
-            {item.description && <p className="text-white/60 text-sm mt-1 max-w-xl line-clamp-1">{item.description}</p>}
-          </div>
-          <div className="flex gap-2 flex-shrink-0">
-            <Link to="/enquiry" className="inline-flex items-center gap-1.5 text-xs font-semibold bg-[#c8a45d] hover:bg-[#b8944d] text-black px-4 py-2 rounded transition-colors">
-              <Mail className="w-3.5 h-3.5" /> Enquiry
-            </Link>
-            {videos.length > 0 && (
-              <button onClick={() => setVideoModal(videos[0])} className="inline-flex items-center gap-1.5 text-xs font-semibold bg-white/10 hover:bg-white/20 text-white px-4 py-2 rounded border border-white/20 transition-colors">
-                <MonitorPlay className="w-3.5 h-3.5" /> Watch Demo
-              </button>
-            )}
-          </div>
+          {f'<div style="background:#f0f9ff; border:1px solid #bae6fd; padding:16px 20px; border-radius:4px; margin-bottom:20px;"><p style="margin:0; font-size:13px; color:#666;">Note from our team:</p><p style="margin:8px 0 0; color:#333; font-size:14px; line-height:1.6;">{admin_note}</p></div>' if admin_note else ''}
+          <p style="color:#555; font-size:14px; line-height:1.6;">
+            If you have any questions, please contact us at
+            <a href="mailto:sales@diplindia.com" style="color:#1f3d31;">sales@diplindia.com</a>
+            or call <b>0731-4042133</b>.
+          </p>
+        </div>
+        <div style="background:#f8f7f2; padding:16px 32px; border-top:1px solid #eee;">
+          <p style="margin:0; font-size:12px; color:#999;">© 2026 Digital Integrator Pvt. Ltd. | 46-A Electronic Complex, Pardeshipura, Indore - 452010</p>
         </div>
       </div>
+    </body>
+    </html>
+    """
 
-      {/* Grid */}
-      <div className={`grid lg:grid-cols-2 gap-0 ${reverse ? "lg:[&>*:first-child]:order-2" : ""}`}>
 
-        {/* LEFT — Gallery */}
-        <div className="relative bg-[#f5f5f3] border-r border-gray-100">
-          {images.length > 0 ? (
-            <div>
-              <div className="relative overflow-hidden cursor-zoom-in group" style={{ aspectRatio: "4/3" }} onClick={() => setLightbox(mainImage)}>
-                <img
-                  key={mainImage}
-                  src={images[mainImage]}
-                  alt={item.name}
-                  className="w-full h-full object-contain p-6 transition-all duration-500 animate-fade"
-                  onError={(e) => { e.currentTarget.parentElement.style.display = "none"; }}
-                />
+def repair_status_email(name: str, status: str, admin_note: str, ref_id: str, equipment: str) -> str:
+    status_colors = {
+        "pending":     "#f59e0b",
+        "received":    "#8b5cf6",
+        "diagnosing":  "#3b82f6",
+        "in_repair":   "#f97316",
+        "repaired":    "#10b981",
+        "dispatched":  "#06b6d4",
+        "completed":   "#10b981",
+        "rejected":    "#ef4444",
+    }
+    color = status_colors.get(status.lower(), "#1f3d31")
+    status_label = status.replace("_", " ").title()
 
-                {/* Left Arrow */}
-                {images.length > 1 && (
-                  <button
-                    onClick={(e) => { e.stopPropagation(); setMainImage((p) => (p - 1 + images.length) % images.length); }}
-                    className="absolute left-3 top-1/2 -translate-y-1/2 w-9 h-9 bg-black/50 hover:bg-[#c8a45d] text-white rounded-full flex items-center justify-center transition-all opacity-0 group-hover:opacity-100 z-10 shadow-lg"
-                  >
-                    <ChevronLeft className="w-5 h-5" />
-                  </button>
-                )}
-
-                {/* Right Arrow */}
-                {images.length > 1 && (
-                  <button
-                    onClick={(e) => { e.stopPropagation(); setMainImage((p) => (p + 1) % images.length); }}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 w-9 h-9 bg-black/50 hover:bg-[#c8a45d] text-white rounded-full flex items-center justify-center transition-all opacity-0 group-hover:opacity-100 z-10 shadow-lg"
-                  >
-                    <ChevronRight className="w-5 h-5" />
-                  </button>
-                )}
-
-                {/* Image counter */}
-                {images.length > 1 && (
-                  <div className="absolute top-3 left-3 bg-black/50 text-white text-xs px-2 py-1 rounded-full z-10">
-                    {mainImage + 1} / {images.length}
-                  </div>
-                )}
-
-                <div className="absolute inset-0 bg-black/0 group-hover:bg-black/5 transition-colors pointer-events-none" />
-
-                {videos.length > 0 && (
-                  <button onClick={(e) => { e.stopPropagation(); setVideoModal(videos[0]); }} className="absolute bottom-4 right-4 flex items-center gap-2 bg-black/70 hover:bg-[#c8a45d] text-white text-xs font-semibold px-3 py-2 rounded-full transition-all z-10">
-                    <Play className="w-3.5 h-3.5 fill-current" /> Watch Demo
-                  </button>
-                )}
-              </div>
-
-              {images.length > 1 && (
-                <div className="flex gap-2 p-3 bg-white border-t border-gray-100 overflow-x-auto scrollbar-hide">
-                  {images.map((src, i) => (
-                    <button key={i} onClick={() => setMainImage(i)} className={`flex-shrink-0 w-16 h-16 rounded-lg overflow-hidden border-2 transition-all duration-300 ${i === mainImage ? "border-[#c8a45d] scale-105 shadow-md" : "border-gray-200 hover:border-[#c8a45d]/50 opacity-70 hover:opacity-100"}`}>
-                      <img src={src} alt="" className="w-full h-full object-contain p-1" onError={(e) => { e.currentTarget.parentElement.style.display = "none"; }} />
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="flex items-center justify-center" style={{ aspectRatio: "4/3" }}>
-              <div className="text-center text-gray-300">
-                <Cpu className="w-16 h-16 mx-auto mb-2 opacity-30" />
-                <p className="text-sm">No image available</p>
-              </div>
-            </div>
-          )}
+    return f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; background:#f8f7f2; margin:0; padding:0;">
+      <div style="max-width:600px; margin:30px auto; background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+        <div style="background:#1f3d31; padding:24px 32px;">
+          <h1 style="color:#c8a45d; margin:0; font-size:22px;">Digital Integrator Pvt. Ltd.</h1>
+          <p style="color:#ffffff99; margin:6px 0 0; font-size:13px;">Repair Request Status Update</p>
         </div>
-
-        {/* RIGHT — Info */}
-        <div className="flex flex-col">
-          <div className="flex border-b border-gray-100 bg-gray-50/50">
-            {tabs.map((tab) => (
-              <button key={tab.id} onClick={() => setActiveTab(tab.id)} className={`flex-1 px-4 py-3 text-xs font-semibold uppercase tracking-wider transition-all border-b-2 ${activeTab === tab.id ? "border-[#c8a45d] text-[#0d1f2d] bg-white" : "border-transparent text-gray-400 hover:text-gray-600 hover:bg-gray-50"}`}>
-                {tab.label}
-              </button>
-            ))}
+        <div style="padding:32px;">
+          <p style="color:#333; font-size:15px;">Dear <b>{name}</b>,</p>
+          <p style="color:#555; font-size:14px; line-height:1.6;">
+            Your repair request (Ref: <b>{ref_id[:8].upper()}</b>) for <b>{equipment}</b> has been updated.
+          </p>
+          <div style="background:#f8f7f2; border-left:4px solid {color}; padding:16px 20px; margin:20px 0; border-radius:4px;">
+            <p style="margin:0; font-size:13px; color:#666; text-transform:uppercase; letter-spacing:1px;">Repair Status</p>
+            <p style="margin:6px 0 0; font-size:20px; font-weight:bold; color:{color};">{status_label}</p>
           </div>
-
-          <div className="flex-1 p-6 sm:p-8">
-            {activeTab === "overview" && (
-              <div className="space-y-5">
-                {item.description && <p className="text-[15px] text-gray-600 leading-relaxed">{item.description}</p>}
-                {specs.length > 0 && (
-                  <div>
-                    <h4 className="text-xs font-bold uppercase tracking-widest text-[#c8a45d] mb-3">Main Functions</h4>
-                    <ul className="space-y-2">
-                      {specs.slice(0, 5).map((s, i) => (
-                        <li key={i} className="flex items-start gap-2.5 text-sm text-gray-600">
-                          <span className="w-1.5 h-1.5 rounded-full bg-[#c8a45d] flex-shrink-0 mt-2" />{s}
-                        </li>
-                      ))}
-                      {specs.length > 5 && <li><button onClick={() => setActiveTab("specs")} className="text-xs text-[#c8a45d] hover:underline font-medium">+{specs.length - 5} more →</button></li>}
-                    </ul>
-                  </div>
-                )}
-              </div>
-            )}
-            {activeTab === "specs" && (
-              <div>
-                <h4 className="text-xs font-bold uppercase tracking-widest text-[#c8a45d] mb-4">Technical Specifications</h4>
-                {specs.length > 0 ? (
-                  <ul className="space-y-2.5">
-                    {specs.map((s, i) => (
-                      <li key={i} className="flex items-start gap-3 text-sm text-gray-600 pb-2.5 border-b border-gray-50 last:border-0">
-                        <ChevronRight className="w-4 h-4 text-[#c8a45d] flex-shrink-0 mt-0.5" />{s}
-                      </li>
-                    ))}
-                  </ul>
-                ) : <p className="text-gray-400 text-sm italic">No specifications available.</p>}
-              </div>
-            )}
-            {activeTab === "demo" && videos.length > 0 && (
-              <div className="space-y-3">
-                <h4 className="text-xs font-bold uppercase tracking-widest text-[#c8a45d] mb-4">Simulator Demo</h4>
-                {videos.map((vid, i) => {
-                  const ytId = getYoutubeId(vid);
-                  return (
-                    <button key={i} onClick={() => setVideoModal(vid)} className="w-full group relative rounded-lg overflow-hidden border border-gray-200 hover:border-[#c8a45d] transition-colors">
-                      {ytId ? (
-                        <img src={`https://img.youtube.com/vi/${ytId}/mqdefault.jpg`} alt="" className="w-full aspect-video object-cover group-hover:scale-105 transition-transform duration-300" />
-                      ) : (
-                        <div className="w-full aspect-video bg-[#0d1f2d] flex items-center justify-center"><MonitorPlay className="w-12 h-12 text-white/40" /></div>
-                      )}
-                      <div className="absolute inset-0 bg-black/40 flex items-center justify-center">
-                        <div className="w-14 h-14 bg-[#c8a45d] rounded-full flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
-                          <Play className="w-6 h-6 text-black fill-current ml-1" />
-                        </div>
-                      </div>
-                      <p className="absolute bottom-3 left-3 text-white text-xs font-medium bg-black/60 px-2 py-1 rounded">Video {i + 1}</p>
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-
-          <div className="p-4 border-t border-gray-100 bg-gray-50/50 flex flex-wrap gap-2">
-            <Link to="/enquiry" className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#0d1f2d] bg-[#c8a45d] hover:bg-[#b8944d] px-4 py-2.5 rounded transition-colors">
-              <Mail className="w-3.5 h-3.5" /> Send Enquiry
-            </Link>
-          </div>
+          {f'<div style="background:#f0f9ff; border:1px solid #bae6fd; padding:16px 20px; border-radius:4px; margin-bottom:20px;"><p style="margin:0; font-size:13px; color:#666;">Note from our team:</p><p style="margin:8px 0 0; color:#333; font-size:14px; line-height:1.6;">{admin_note}</p></div>' if admin_note else ''}
+          <p style="color:#555; font-size:14px; line-height:1.6;">
+            For queries, contact us at
+            <a href="mailto:sales@diplindia.com" style="color:#1f3d31;">sales@diplindia.com</a>
+            or call <b>0731-4042133</b>.
+          </p>
+        </div>
+        <div style="background:#f8f7f2; padding:16px 32px; border-top:1px solid #eee;">
+          <p style="margin:0; font-size:12px; color:#999;">© 2026 Digital Integrator Pvt. Ltd. | 46-A Electronic Complex, Pardeshipura, Indore - 452010</p>
         </div>
       </div>
+    </body>
+    </html>
+    """
 
-      {videoModal && <VideoModal url={videoModal} onClose={() => setVideoModal(null)} />}
-      {lightbox !== null && <Lightbox images={images} index={lightbox} onClose={() => setLightbox(null)} />}
-    </article>
-  );
-};
 
-const SimulatorsPage = () => {
-  const [simulators, setSimulators] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+def create_jwt_token(username: str) -> str:
+    payload = {
+        "username": username,
+        "role": "admin",
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-  useEffect(() => { window.scrollTo(0, 0); }, []);
+def create_jwt_token_with_role(username: str, role: str, admin_id: str) -> str:
+    payload = {
+        "username": username,
+        "role": role,
+        "admin_id": admin_id,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const catRes = await fetch(`${API_BASE_URL}/api/product-categories`);
-        const catData = await catRes.json();
-        const simCat = (Array.isArray(catData) ? catData : []).find(c =>
-          String(c.name || "").toLowerCase().includes("simulator")
-        );
-        if (!simCat) { setSimulators([]); setLoading(false); return; }
-        const prodRes = await fetch(`${API_BASE_URL}/api/products?category_id=${simCat.id}&published=true`);
-        const prodData = await prodRes.json();
-        setSimulators(Array.isArray(prodData) ? prodData : []);
-      } catch (err) {
-        setError("Unable to load simulators right now.");
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, []);
 
-  return (
-    <div className="min-h-screen bg-[#f4f3ef]">
-      <Header />
-      <main>
+def verify_jwt_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """Verify JWT token"""
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-        {/* HERO */}
-        <section className="relative pt-32 pb-20 bg-gradient-to-br from-[#0d1f2d] via-[#1a3347] to-[#0d2a1e] overflow-hidden">
-          <div className="absolute inset-0 opacity-5">
-            {[...Array(6)].map((_, i) => (
-              <div key={i} className="absolute border border-white/20 rounded-full"
-                style={{ width: `${(i + 1) * 200}px`, height: `${(i + 1) * 200}px`, top: "50%", left: "50%", transform: "translate(-50%,-50%)" }} />
-            ))}
-          </div>
-          <div className="container-width px-4 sm:px-6 lg:px-8 relative">
-            <div className="max-w-4xl">
-              <div className="inline-flex items-center gap-2 bg-[#c8a45d]/20 border border-[#c8a45d]/30 text-[#c8a45d] text-xs font-semibold uppercase tracking-widest px-4 py-2 rounded-full mb-6">
-                <MonitorPlay className="w-3.5 h-3.5" /> Training Systems
-              </div>
-              <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold text-white mb-6 leading-tight">
-                Simulators &<br /><span className="text-[#c8a45d]">Training Systems</span>
-              </h1>
-              <p className="text-lg text-white/70 max-w-2xl leading-relaxed mb-8">
-                100% indigenously developed simulation platforms for modern defence readiness — enabling realistic training without operational risk.
-              </p>
-              <div className="flex flex-wrap gap-8">
-                {[{ v: "100%", l: "Indigenous" }, { v: "ISO", l: "9001:2015" }, { v: "33+", l: "Years" }].map(s => (
-                  <div key={s.l}>
-                    <p className="text-3xl font-bold text-[#c8a45d]">{s.v}</p>
-                    <p className="text-white/60 text-sm">{s.l}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        </section>
 
-        {/* CONTENT */}
-        <div className="container-width px-4 sm:px-6 lg:px-8 py-12">
-          {loading ? (
-            <div className="flex flex-col items-center justify-center py-32 gap-4">
-              <Loader2 className="w-10 h-10 animate-spin text-[#c8a45d]" />
-              <p className="text-gray-400 text-sm">Loading simulators...</p>
-            </div>
-          ) : error ? (
-            <div className="text-center py-20 text-red-500">{error}</div>
-          ) : simulators.length === 0 ? (
-            <div className="text-center py-20 text-gray-400">No simulators found.</div>
-          ) : (
-            <div className="space-y-6">
-              {simulators.map((item, i) => (
-                <Reveal key={item.id} delay={i * 80}>
-                  <SimulatorCard item={item} reverse={i % 2 !== 0} />
-                </Reveal>
-              ))}
-            </div>
-          )}
-        </div>
+def serialize_datetime(doc: dict) -> dict:
+    """Convert datetime objects to ISO strings"""
+    for key, value in doc.items():
+        if isinstance(value, datetime):
+            doc[key] = value.isoformat()
+    return doc
 
-        {/* CTA */}
-        <section className="bg-gradient-to-r from-[#0d1f2d] to-[#1a3347] py-16">
-          <div className="container-width px-4 sm:px-6 lg:px-8 text-center">
-            <h2 className="text-2xl sm:text-3xl font-bold text-white mb-4">Request a Live Demonstration</h2>
-            <p className="text-white/70 mb-8 max-w-xl mx-auto">Experience our simulators firsthand. Contact our team to schedule a demo at your facility.</p>
-            <div className="flex flex-wrap justify-center gap-4">
-              <Link to="/enquiry" className="inline-flex items-center gap-2 bg-[#c8a45d] hover:bg-[#b8944d] text-black font-bold px-8 py-3 rounded transition-all shadow-lg">
-                <Mail className="w-4 h-4" /> Send Enquiry
-              </Link>
-              <Link to="/defence-systems" className="inline-flex items-center gap-2 bg-white/10 hover:bg-white/20 border border-white/20 text-white font-semibold px-8 py-3 rounded transition-all">
-                Defence Systems <ChevronRight className="w-4 h-4" />
-              </Link>
-            </div>
-          </div>
-        </section>
 
-      </main>
-      <Footer />
-    </div>
-  );
-};
+def serialize_datetime(doc: dict) -> dict:
+    """Convert datetime objects to ISO strings"""
+    for key, value in doc.items():
+        if isinstance(value, datetime):
+            doc[key] = value.isoformat()
+    return doc
+# ===================== HOME PAGE ===========================
+@app.get("/api/home")
+async def get_home():
+    data = await db.home.find({"published": True}).to_list(100)
+    return data
+@app.post("/api/home")
+async def create_home(content: HomePageContent):
+    content_dict = content.dict()
+    content_dict["id"] = str(uuid.uuid4())
+    await db.home.insert_one(content_dict)
+    return content_dict
+@app.put("/api/home/{id}")
+async def update_home(id: str, content: HomePageContent):
+    await db.home.update_one(
+        {"id": id},
+        {"$set": content.dict()}
+    )
+    return {"message": "updated"}
+@app.delete("/api/home/{id}")
+async def delete_home(id: str):
+    await db.home.delete_one({"id": id})
+    return {"message": "deleted"}
+# ==================== ADMIN AUTH ROUTES ====================
 
-export default SimulatorsPage;
+# ==================== ADMIN MANAGEMENT HELPERS ====================
+
+SUPER_ADMIN_USERNAME = os.environ.get("SUPER_ADMIN_USERNAME", "sunil_vyas")
+SUPER_ADMIN_PASSWORD = os.environ.get("SUPER_ADMIN_PASSWORD", "Sunil@123")
+CEO_EMAIL = os.environ.get("CEO_EMAIL", SMTP_EMAIL)
+
+def hash_password(password: str) -> str:
+    import hashlib
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_password(password: str, hashed: str) -> bool:
+    import hashlib
+    return hashlib.sha256(password.encode()).hexdigest() == hashed
+
+async def get_admin_by_username(username: str):
+    return await db.admin_users.find_one({"username": username, "is_active": True}, {"_id": 0})
+
+async def ensure_super_admin_exists():
+    existing = await db.admin_users.find_one({"username": SUPER_ADMIN_USERNAME})
+    if not existing:
+        doc = {
+            "id": str(uuid.uuid4()),
+            "username": SUPER_ADMIN_USERNAME,
+            "password_hash": hash_password(SUPER_ADMIN_PASSWORD),
+            "role": "super_admin",
+            "email": CEO_EMAIL,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_by": "system",
+            "is_active": True,
+        }
+        await db.admin_users.insert_one(doc)
+        logger.info(f"Super admin created: {SUPER_ADMIN_USERNAME}")
+
+def send_ceo_acknowledgment(action: str, target_username: str, performed_by: str):
+    subject = f"Admin Management Alert - {action}"
+    body = f"""
+    <html><body style="font-family:Arial,sans-serif;padding:20px;">
+    <h2 style="color:#1f3d31;">Admin Management Alert</h2>
+    <p>An admin management action was performed on the DIPL Website CMS.</p>
+    <table style="border-collapse:collapse;width:100%;max-width:500px;">
+      <tr><td style="padding:8px;border:1px solid #ddd;"><b>Action</b></td><td style="padding:8px;border:1px solid #ddd;">{action}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;"><b>Target Admin</b></td><td style="padding:8px;border:1px solid #ddd;">{target_username}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;"><b>Performed By</b></td><td style="padding:8px;border:1px solid #ddd;">{performed_by}</td></tr>
+      <tr><td style="padding:8px;border:1px solid #ddd;"><b>Date & Time</b></td><td style="padding:8px;border:1px solid #ddd;">{datetime.now(timezone.utc).strftime("%d %b %Y, %I:%M %p UTC")}</td></tr>
+    </table>
+    <p style="color:#666;font-size:12px;margin-top:20px;">Digital Integrator Private Limited<br>46-A, Electronic Complex Pardeshipura, Indore, MP - 452001</p>
+    </body></html>
+    """
+    send_custom_email(CEO_EMAIL, subject, body)
+
+# ==================== ADMIN AUTH ROUTES ====================
+
+@api_router.post("/admin/login", response_model=AdminLoginResponse)
+async def admin_login(request: AdminLoginRequest):
+    """Admin login - super admin gets 2FA OTP first"""
+    await ensure_super_admin_exists()
+
+    # Check DB first
+    admin = await get_admin_by_username(request.username)
+
+    if admin:
+        if not verify_password(request.password, admin["password_hash"]):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        # Super admin needs 2FA
+        if admin["role"] == "super_admin":
+            if not request.otp:
+                # Send OTP to CEO email
+                otp_code = str(random.randint(100000, 999999))
+                await db.admin_otp.delete_many({"email": admin.get("email", CEO_EMAIL)})
+                await db.admin_otp.insert_one({
+                    "email": admin.get("email", CEO_EMAIL),
+                    "otp": otp_code,
+                    "expires": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+                    "used": False,
+                })
+                await send_email_otp(admin.get("email", CEO_EMAIL), otp_code)
+                return AdminLoginResponse(token="", message="OTP sent to CEO email", role="super_admin", requires_otp=True)
+
+            # Verify OTP from MongoDB
+            ceo_email = admin.get("email", CEO_EMAIL)
+            stored = await db.admin_otp.find_one({"email": ceo_email, "used": False})
+            if not stored or stored["otp"] != request.otp:
+                raise HTTPException(status_code=401, detail="Invalid or expired OTP")
+            if datetime.now(timezone.utc) > datetime.fromisoformat(stored["expires"]):
+                raise HTTPException(status_code=401, detail="OTP expired")
+            await db.admin_otp.update_one({"_id": stored["_id"]}, {"$set": {"used": True}})
+
+        token = create_jwt_token(request.username)
+        payload_extra = {"role": admin["role"], "admin_id": admin["id"]}
+        token = create_jwt_token_with_role(request.username, admin["role"], admin["id"])
+        return AdminLoginResponse(token=token, message="Login successful", role=admin["role"])
+
+    # Fallback: env-based admin (backward compat)
+    if request.username == ADMIN_USERNAME and request.password == ADMIN_PASSWORD:
+        token = create_jwt_token(request.username)
+        return AdminLoginResponse(token=token, message="Login successful", role="admin")
+
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+@api_router.get("/admin/verify")
+async def verify_admin(payload: dict = Depends(verify_jwt_token)):
+    return {"valid": True, "username": payload["username"], "role": payload.get("role", "admin")}
+
+# ==================== SUPER ADMIN MANAGEMENT ROUTES ====================
+
+@api_router.get("/admin/users")
+async def list_admin_users(payload: dict = Depends(verify_jwt_token)):
+    if payload.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Super admin access required")
+    users = await db.admin_users.find({}, {"_id": 0, "password_hash": 0}).sort("created_at", 1).to_list(100)
+    return users
+
+@api_router.post("/admin/users")
+async def create_admin_user(request: CreateAdminRequest, payload: dict = Depends(verify_jwt_token)):
+    if payload.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Super admin access required")
+
+    # Verify OTP from MongoDB
+    stored = await db.admin_otp.find_one({"email": CEO_EMAIL, "used": False})
+    if not stored or stored["otp"] != request.otp:
+        raise HTTPException(status_code=401, detail="Invalid or expired OTP")
+    if datetime.now(timezone.utc) > datetime.fromisoformat(stored["expires"]):
+        raise HTTPException(status_code=401, detail="OTP expired")
+    await db.admin_otp.update_one({"_id": stored["_id"]}, {"$set": {"used": True}})
+
+    existing = await db.admin_users.find_one({"username": request.username})
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "username": request.username,
+        "password_hash": hash_password(request.password),
+        "role": "admin",
+        "email": request.email or "",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_by": payload["username"],
+        "is_active": True,
+    }
+    await db.admin_users.insert_one(doc)
+
+    send_ceo_acknowledgment("New Admin Created", request.username, payload["username"])
+    return {"message": f"Admin '{request.username}' created successfully"}
+
+@api_router.delete("/admin/users/{admin_id}")
+async def delete_admin_user(admin_id: str, request: DeleteAdminRequest, payload: dict = Depends(verify_jwt_token)):
+    if payload.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Super admin access required")
+
+    # Verify OTP from MongoDB
+    stored = await db.admin_otp.find_one({"email": CEO_EMAIL, "used": False})
+    if not stored or stored["otp"] != request.otp:
+        raise HTTPException(status_code=401, detail="Invalid or expired OTP")
+    if datetime.now(timezone.utc) > datetime.fromisoformat(stored["expires"]):
+        raise HTTPException(status_code=401, detail="OTP expired")
+    await db.admin_otp.update_one({"_id": stored["_id"]}, {"$set": {"used": True}})
+
+    target = await db.admin_users.find_one({"id": admin_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Admin not found")
+    if target.get("role") == "super_admin":
+        raise HTTPException(status_code=400, detail="Cannot delete super admin")
+
+    await db.admin_users.update_one({"id": admin_id}, {"$set": {"is_active": False}})
+    send_ceo_acknowledgment("Admin Deleted", target["username"], payload["username"])
+    return {"message": f"Admin '{target['username']}' deleted"}
+
+@api_router.post("/admin/send-management-otp")
+async def send_management_otp(payload: dict = Depends(verify_jwt_token)):
+    if payload.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Super admin access required")
+    otp_code = str(random.randint(100000, 999999))
+    await db.admin_otp.delete_many({"email": CEO_EMAIL})
+    await db.admin_otp.insert_one({
+        "email": CEO_EMAIL,
+        "otp": otp_code,
+        "expires": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+        "used": False,
+    })
+    await send_email_otp(CEO_EMAIL, otp_code)
+    return {"message": "OTP sent to CEO email"}
+
+@api_router.put("/admin/change-password")
+async def change_password(request: ChangePasswordRequest, payload: dict = Depends(verify_jwt_token)):
+    admin = await get_admin_by_username(payload["username"])
+    if not admin:
+        raise HTTPException(status_code=404, detail="Admin not found")
+    if not verify_password(request.current_password, admin["password_hash"]):
+        raise HTTPException(status_code=401, detail="Current password incorrect")
+    await db.admin_users.update_one(
+        {"username": payload["username"]},
+        {"$set": {"password_hash": hash_password(request.new_password)}}
+    )
+    if payload.get("role") == "super_admin":
+        send_ceo_acknowledgment("Password Changed", payload["username"], payload["username"])
+    return {"message": "Password changed successfully"}
+
+@api_router.put("/admin/change-username")
+async def change_username(request: ChangeUsernameRequest, payload: dict = Depends(verify_jwt_token)):
+    admin = await get_admin_by_username(payload["username"])
+    if not admin:
+        raise HTTPException(status_code=404, detail="Admin not found")
+    if not verify_password(request.current_password, admin["password_hash"]):
+        raise HTTPException(status_code=401, detail="Current password incorrect")
+    existing = await db.admin_users.find_one({"username": request.new_username})
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already taken")
+    await db.admin_users.update_one(
+        {"username": payload["username"]},
+        {"$set": {"username": request.new_username}}
+    )
+    return {"message": "Username changed successfully"}
+
+
+# ==================== OTP ROUTES ====================
+
+
+@api_router.post("/otp/send")
+async def send_otp(request: OTPSendRequest):
+    """Send OTP to email"""
+    try:
+        otp_code = generate_otp()
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+        await db.otp_verifications.delete_many({"email": request.email})
+
+        otp_doc = {
+            "id": str(uuid.uuid4()),
+            "email": request.email,
+            "otp_code": otp_code,
+            "form_type": request.form_type,
+            "verified": False,
+            "expires_at": expires_at.isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.otp_verifications.insert_one(otp_doc)
+
+        email_sent = await send_email_otp(request.email, otp_code)
+
+        if not email_sent:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to send email. Please check SMTP configuration."
+            )
+
+        logger.info(f"OTP generated for {request.email}: {otp_code}")
+        return {"message": "OTP sent successfully", "email": request.email}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error sending OTP: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/otp/verify")
+async def verify_otp(request: OTPVerifyRequest):
+    """Verify OTP code"""
+    try:
+        otp_doc = await db.otp_verifications.find_one({
+            "email": request.email,
+            "otp_code": request.otp_code,
+            "verified": False
+        })
+
+        if not otp_doc:
+            raise HTTPException(status_code=400, detail="Invalid OTP code")
+
+        expires_at = datetime.fromisoformat(otp_doc["expires_at"])
+        if datetime.now(timezone.utc) > expires_at:
+            raise HTTPException(status_code=400, detail="OTP has expired")
+
+        await db.otp_verifications.update_one(
+            {"_id": otp_doc["_id"]},
+            {"$set": {"verified": True}}
+        )
+
+        return {"message": "Email verified successfully", "verified": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error verifying OTP: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== ENQUIRY & REPAIR ROUTES ====================
+
+@api_router.post("/enquiry/submit")
+async def submit_enquiry(enquiry: EnquirySubmission):
+    """Submit enquiry form"""
+    try:
+        verified = await db.otp_verifications.find_one({
+            "email": enquiry.email,
+            "verified": True
+        })
+
+        if not verified:
+            raise HTTPException(status_code=400, detail="Email not verified")
+
+        doc = enquiry.model_dump()
+        doc["created_at"] = doc["created_at"].isoformat()
+        doc["updated_at"] = doc["updated_at"].isoformat()
+        await db.contact_submissions.insert_one(doc)
+
+        try:
+            send_custom_email(
+                to_email=enquiry.email,
+                subject="We received your enquiry",
+                html_body=enquiry_ack_email(enquiry)
+            )
+        except Exception as e:
+            logger.error(f"Acknowledgement email failed: {str(e)}")
+
+        try:
+            send_custom_email(
+                to_email=SMTP_EMAIL,
+                subject="New enquiry received",
+                html_body=enquiry_team_email(enquiry)
+            )
+        except Exception as e:
+            logger.error(f"Team notification email failed: {str(e)}")
+
+        logger.info(f"Enquiry submitted by {enquiry.email}")
+        return {"message": "Enquiry submitted successfully", "id": enquiry.id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error submitting enquiry: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/repair/submit")
+async def submit_repair(repair: RepairSubmission):
+    """Submit repair request"""
+    try:
+        verified = await db.otp_verifications.find_one({
+            "email": repair.email,
+            "verified": True
+        })
+
+        if not verified:
+            raise HTTPException(status_code=400, detail="Email not verified")
+
+        doc = repair.model_dump()
+        doc["created_at"] = doc["created_at"].isoformat()
+        doc["updated_at"] = doc["updated_at"].isoformat()
+        await db.repair_submissions.insert_one(doc)
+
+        try:
+            send_custom_email(
+                to_email=repair.email,
+                subject="We received your repair request",
+                html_body=repair_ack_email(repair)
+            )
+        except Exception as e:
+            logger.error(f"Repair acknowledgement email failed: {str(e)}")
+
+        try:
+            send_custom_email(
+                to_email=SMTP_EMAIL,
+                subject="New repair request received",
+                html_body=repair_team_email(repair)
+            )
+        except Exception as e:
+            logger.error(f"Repair team notification email failed: {str(e)}")
+
+        logger.info(f"Repair request submitted by {repair.email}")
+        return {"message": "Repair request submitted successfully", "id": repair.id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error submitting repair: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/enquiries")
+async def get_enquiries(payload: dict = Depends(verify_jwt_token)):
+    """Get all enquiries (Admin only)"""
+    enquiries = await db.contact_submissions.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    for enq in enquiries:
+        enq.setdefault("status", "Pending")
+        enq.setdefault("admin_note", "")
+        if isinstance(enq.get("created_at"), str):
+            enq["created_at"] = datetime.fromisoformat(enq["created_at"]).isoformat()
+        if isinstance(enq.get("updated_at"), str):
+            enq["updated_at"] = datetime.fromisoformat(enq["updated_at"]).isoformat()
+    return enquiries
+
+
+@api_router.put("/enquiries/{enquiry_id}/status")
+async def update_enquiry_status(
+    enquiry_id: str,
+    request: StatusUpdateRequest,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Update enquiry status/admin note (Admin only) + send email to user"""
+    # Fetch enquiry first to get user email
+    enquiry = await db.contact_submissions.find_one(
+        {"$or": [{"id": enquiry_id}, {"_id": enquiry_id}]},
+        {"_id": 0}
+    )
+    if not enquiry:
+        raise HTTPException(status_code=404, detail="Enquiry not found")
+
+    result = await db.contact_submissions.update_one(
+        {"$or": [{"id": enquiry_id}, {"_id": enquiry_id}]},
+        {
+            "$set": {
+                "status": request.status,
+                "admin_note": request.admin_note or "",
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+        }
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Enquiry not found")
+
+    # Send status update email to user
+    user_email = enquiry.get("email", "")
+    user_name  = enquiry.get("name", "Customer")
+    ref_id     = enquiry.get("id", enquiry_id)
+
+    if user_email:
+        try:
+            await send_email_async(
+                to_email=user_email,
+                subject=f"Your Enquiry Status Update — {request.status.replace('_',' ').title()} | DIPL",
+                html_content=enquiry_status_email(user_name, request.status, request.admin_note or "", ref_id)
+            )
+            logger.info(f"Status email sent to {user_email} for enquiry {ref_id}")
+        except Exception as e:
+            logger.error(f"Failed to send status email: {e}")
+
+    return {"message": "Enquiry status updated and email sent to user"}
+
+
+@api_router.put("/enquiries/{enquiry_id}")
+async def update_enquiry(
+    enquiry_id: str,
+    updates: Dict[str, Any],
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Update full enquiry record (Admin only)"""
+    updates.pop("_id", None)
+    updates.pop("id", None)
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    result = await db.contact_submissions.update_one(
+        {"id": enquiry_id},
+        {"$set": updates}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Enquiry not found")
+
+    return {"message": "Enquiry updated successfully"}
+
+
+@api_router.delete("/enquiries/{enquiry_id}")
+async def delete_enquiry(
+    enquiry_id: str,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Delete enquiry record (Admin only)"""
+    result = await db.contact_submissions.delete_one({"id": enquiry_id})
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Enquiry not found")
+
+    return {"message": "Enquiry deleted successfully"}
+
+
+@api_router.get("/repairs")
+async def get_repairs(payload: dict = Depends(verify_jwt_token)):
+    """Get all repair requests (Admin only)"""
+    repairs = await db.repair_submissions.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    for rep in repairs:
+        rep.setdefault("status", "Pending")
+        rep.setdefault("admin_note", "")
+        if isinstance(rep.get("created_at"), str):
+            rep["created_at"] = datetime.fromisoformat(rep["created_at"]).isoformat()
+        if isinstance(rep.get("updated_at"), str):
+            rep["updated_at"] = datetime.fromisoformat(rep["updated_at"]).isoformat()
+    return repairs
+
+
+@api_router.put("/repairs/{repair_id}/status")
+async def update_repair_status(
+    repair_id: str,
+    request: StatusUpdateRequest,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Update repair status/admin note (Admin only) + send email to user"""
+    # Fetch repair first
+    repair = await db.repair_submissions.find_one(
+        {"$or": [{"id": repair_id}, {"_id": repair_id}]},
+        {"_id": 0}
+    )
+    if not repair:
+        raise HTTPException(status_code=404, detail="Repair request not found")
+
+    result = await db.repair_submissions.update_one(
+        {"$or": [{"id": repair_id}, {"_id": repair_id}]},
+        {
+            "$set": {
+                "status": request.status,
+                "admin_note": request.admin_note or "",
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+        }
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Repair request not found")
+
+    # Send status update email to user
+    user_email = repair.get("email", "")
+    user_name  = repair.get("name", "Customer")
+    ref_id     = repair.get("id", repair_id)
+    equipment  = repair.get("equipment_category", repair.get("equipment_variant", "Equipment"))
+
+    if user_email:
+        try:
+            await send_email_async(
+                to_email=user_email,
+                subject=f"Repair Request Status Update — {request.status.replace('_',' ').title()} | DIPL",
+                html_content=repair_status_email(user_name, request.status, request.admin_note or "", ref_id, equipment)
+            )
+            logger.info(f"Status email sent to {user_email} for repair {ref_id}")
+        except Exception as e:
+            logger.error(f"Failed to send repair status email: {e}")
+
+    return {"message": "Repair status updated and email sent to user"}
+
+
+@api_router.put("/repairs/{repair_id}")
+async def update_repair(
+    repair_id: str,
+    updates: Dict[str, Any],
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Update full repair record (Admin only)"""
+    updates.pop("_id", None)
+    updates.pop("id", None)
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    result = await db.repair_submissions.update_one(
+        {"id": repair_id},
+        {"$set": updates}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Repair request not found")
+
+    return {"message": "Repair updated successfully"}
+
+
+@api_router.delete("/repairs/{repair_id}")
+async def delete_repair(
+    repair_id: str,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Delete repair request and its local uploaded images (Admin only)"""
+    repair = await db.repair_submissions.find_one({"id": repair_id})
+
+    if not repair:
+        raise HTTPException(status_code=404, detail="Repair request not found")
+
+    for image_url in repair.get("image_urls", []):
+        try:
+            filename = image_url.split("/")[-1]
+            file_path = ROOT_DIR / "uploads" / filename
+            if file_path.exists():
+                file_path.unlink()
+        except Exception as e:
+            logger.warning(f"Could not delete uploaded repair image: {str(e)}")
+
+    await db.repair_submissions.delete_one({"id": repair_id})
+
+    return {"message": "Repair deleted successfully"}
+
+# ==================== FILE UPLOAD ====================
+
+@api_router.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload file (images for repair forms)"""
+    try:
+        # Create uploads directory if not exists
+        upload_dir = ROOT_DIR/"uploads"
+        upload_dir.mkdir(exist_ok=True)
+        
+        # Generate unique filename
+        file_ext = Path(file.filename).suffix
+        filename = f"{uuid.uuid4()}{file_ext}"
+        file_path = upload_dir / filename
+        
+        # Save file
+        with file_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # Return file URL
+        file_url = f"/uploads/{filename}"
+        return {"url": file_url, "filename": filename}
+    
+    except Exception as e:
+        logger.error(f"Error uploading file: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@api_router.get("/uploads/download/{filename}")
+async def download_uploaded_file(filename: str):
+    file_path = ROOT_DIR / "uploads" / filename
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(
+        path=file_path,
+        filename=filename,
+        media_type="application/octet-stream"
+    )
+
+# ==================== FORM FIELD BUILDER ROUTES ====================
+
+@api_router.get("/form-fields")
+async def get_form_fields(form_type: Optional[str] = None):
+    """Get dynamic form fields for enquiry/repair forms"""
+    query = {"active": True}
+    if form_type:
+        query["form_type"] = form_type
+
+    fields = await db.form_fields.find(query, {"_id": 0}).sort("sort_order", 1).to_list(1000)
+    return fields
+
+
+@api_router.get("/form-fields/admin")
+async def get_all_form_fields_admin(
+    form_type: Optional[str] = None,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Get all dynamic form fields, including inactive ones (Admin only)"""
+    query = {}
+    if form_type:
+        query["form_type"] = form_type
+
+    fields = await db.form_fields.find(query, {"_id": 0}).sort("sort_order", 1).to_list(1000)
+    return fields
+
+
+@api_router.post("/form-fields")
+async def create_form_field(
+    field: FormField,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Create dynamic form field (Admin only)"""
+    doc = field.model_dump()
+    doc["created_at"] = doc["created_at"].isoformat()
+    doc["updated_at"] = doc["updated_at"].isoformat()
+
+    await db.form_fields.insert_one(doc)
+    return {"message": "Form field created successfully", "id": field.id}
+
+
+@api_router.put("/form-fields/{field_id}")
+async def update_form_field(
+    field_id: str,
+    updates: Dict[str, Any],
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Update dynamic form field (Admin only)"""
+    updates.pop("_id", None)
+    updates.pop("id", None)
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    result = await db.form_fields.update_one(
+        {"id": field_id},
+        {"$set": updates}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Form field not found")
+
+    return {"message": "Form field updated successfully"}
+
+
+@api_router.delete("/form-fields/{field_id}")
+async def delete_form_field(
+    field_id: str,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Soft delete dynamic form field by making it inactive (Admin only)"""
+    result = await db.form_fields.update_one(
+        {"id": field_id},
+        {
+            "$set": {
+                "active": False,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+        }
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Form field not found")
+
+    return {"message": "Form field deleted successfully"}
+
+# ==================== PAGE CONTENT ROUTES ====================
+
+@api_router.get("/page-content")
+async def get_page_content(page: Optional[str] = None):
+    """Get page content"""
+    query = {"published": True}
+    if page:
+        query["page"] = page
+    
+    content = await db.page_content.find(query, {"_id": 0}).sort("sort_order", 1).to_list(1000)
+    return content
+
+@api_router.put("/page-content/{content_id}")
+async def update_page_content(content_id: str, updates: Dict[str, Any], payload: dict = Depends(verify_jwt_token)):
+    """Update page content (Admin only)"""
+    updates['updated_at'] = datetime.now(timezone.utc).isoformat()
+    result = await db.page_content.update_one({"id": content_id}, {"$set": updates})
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Content not found")
+    return {"message": "Content updated successfully"}
+
+@api_router.post("/page-content")
+async def create_page_content(content: PageContent, payload: dict = Depends(verify_jwt_token)):
+    """Create page content (Admin only)"""
+    doc = content.model_dump()
+    doc['created_at'] = doc['created_at'].isoformat()
+    doc['updated_at'] = doc['updated_at'].isoformat()
+    await db.page_content.insert_one(doc)
+    return {"message": "Content created successfully", "id": content.id}
+
+# ==================== PRODUCT ROUTES ====================
+
+@api_router.get("/products")
+async def get_products(category_id: Optional[str] = None, published: bool = True):
+    """Get all products"""
+    query = {"published": published} if published else {}
+    if category_id:
+        query["category_id"] = category_id
+    
+    products = await db.products.find(query, {"_id": 0}).sort("sort_order", 1).to_list(1000)
+    return products
+
+@api_router.get("/products/{product_id}")
+async def get_product(product_id: str):
+    """Get single product"""
+    product = await db.products.find_one({"id": product_id}, {"_id": 0})
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return product
+
+@api_router.post("/products")
+async def create_product(product: Product, payload: dict = Depends(verify_jwt_token)):
+    """Create product (Admin only)"""
+    doc = product.model_dump()
+    doc['created_at'] = doc['created_at'].isoformat()
+    doc['updated_at'] = doc['updated_at'].isoformat()
+    await db.products.insert_one(doc)
+    return {"message": "Product created successfully", "id": product.id}
+
+@api_router.put("/products/{product_id}")
+async def update_product(product_id: str, updates: Dict[str, Any], payload: dict = Depends(verify_jwt_token)):
+    """Update product (Admin only)"""
+    updates['updated_at'] = datetime.now(timezone.utc).isoformat()
+    result = await db.products.update_one({"id": product_id}, {"$set": updates})
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {"message": "Product updated successfully"}
+
+@api_router.delete("/products/{product_id}")
+async def delete_product(product_id: str, payload: dict = Depends(verify_jwt_token)):
+    """Delete product (Admin only)"""
+    result = await db.products.delete_one({"id": product_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {"message": "Product deleted successfully"}
+
+# ==================== PRODUCT CATEGORY ROUTES ====================
+
+
+@api_router.get("/product-categories")
+async def get_product_categories():
+    """Get all product categories"""
+    categories = await db.product_categories.find({}, {"_id": 0}).sort("sort_order", 1).to_list(100)
+    return categories
+
+@api_router.post("/product-categories")
+async def create_product_category(category: ProductCategory, payload: dict = Depends(verify_jwt_token)):
+    """Create product category (Admin only)"""
+    doc = category.model_dump()
+    doc['created_at'] = doc['created_at'].isoformat()
+    doc['updated_at'] = doc['updated_at'].isoformat()
+    await db.product_categories.insert_one(doc)
+    return {"message": "Category created successfully", "id": category.id}
+
+@api_router.put("/product-categories/{category_id}")
+async def update_product_category(category_id: str, updates: Dict[str, Any], payload: dict = Depends(verify_jwt_token)):
+    """Update product category (Admin only)"""
+    updates['updated_at'] = datetime.now(timezone.utc).isoformat()
+    result = await db.product_categories.update_one({"id": category_id}, {"$set": updates})
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Category not found")
+    return {"message": "Category updated successfully"}
+
+@api_router.delete("/product-categories/{category_id}")
+async def delete_product_category(category_id: str, payload: dict = Depends(verify_jwt_token)):
+    """Delete product category (Admin only)"""
+    result = await db.product_categories.delete_one({"id": category_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Category not found")
+    return {"message": "Category deleted successfully"}
+
+# ==================== SERVICE ROUTES ====================
+
+@api_router.get("/services")
+async def get_services(published: bool = True):
+    """Get all services"""
+    query = {"published": published} if published else {}
+    services = await db.services.find(query, {"_id": 0}).sort("sort_order", 1).to_list(1000)
+    return services
+
+@api_router.post("/services")
+async def create_service(service: Service, payload: dict = Depends(verify_jwt_token)):
+    """Create service (Admin only)"""
+    doc = service.model_dump()
+    doc['created_at'] = doc['created_at'].isoformat()
+    doc['updated_at'] = doc['updated_at'].isoformat()
+    await db.services.insert_one(doc)
+    return {"message": "Service created successfully", "id": service.id}
+
+@api_router.put("/services/{service_id}")
+async def update_service(service_id: str, updates: Dict[str, Any], payload: dict = Depends(verify_jwt_token)):
+    """Update service (Admin only)"""
+    updates['updated_at'] = datetime.now(timezone.utc).isoformat()
+    result = await db.services.update_one({"id": service_id}, {"$set": updates})
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Service not found")
+    return {"message": "Service updated successfully"}
+
+@api_router.delete("/services/{service_id}")
+async def delete_service(service_id: str, payload: dict = Depends(verify_jwt_token)):
+    """Delete service (Admin only)"""
+    result = await db.services.delete_one({"id": service_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Service not found")
+    return {"message": "Service deleted successfully"}
+
+# ==================== CLIENT ROUTES ====================
+
+@api_router.get("/clients")
+async def get_clients(published: bool = True):
+    """Get all clients"""
+    query = {"published": published} if published else {}
+    clients = await db.clients.find(query, {"_id": 0}).sort("sort_order", 1).to_list(1000)
+    return clients
+
+@api_router.post("/clients")
+async def create_client(client: Client, payload: dict = Depends(verify_jwt_token)):
+    """Create client (Admin only)"""
+    doc = client.model_dump()
+    doc['created_at'] = doc['created_at'].isoformat()
+    doc['updated_at'] = doc['updated_at'].isoformat()
+    await db.clients.insert_one(doc)
+    return {"message": "Client created successfully", "id": client.id}
+
+@api_router.put("/clients/{client_id}")
+async def update_client(client_id: str, updates: Dict[str, Any], payload: dict = Depends(verify_jwt_token)):
+    """Update client (Admin only)"""
+    updates['updated_at'] = datetime.now(timezone.utc).isoformat()
+    result = await db.clients.update_one({"id": client_id}, {"$set": updates})
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return {"message": "Client updated successfully"}
+
+@api_router.delete("/clients/{client_id}")
+async def delete_client(client_id: str, payload: dict = Depends(verify_jwt_token)):
+    """Delete client (Admin only)"""
+    result = await db.clients.delete_one({"id": client_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return {"message": "Client deleted successfully"}
+
+# =================== ABOUT CATEGORY ROUTES =====================
+
+@api_router.get("/about-categories")
+async def get_about_categories():
+    """Get all about categories"""
+    categories = await db.about_categories.find({}, {"_id": 0}).sort("sort_order", 1).to_list(100)
+    return categories
+
+
+@api_router.get("/about-categories/{category_id}")
+async def get_about_category(category_id: str):
+    """Get single about category"""
+    category = await db.about_categories.find_one({"id": category_id}, {"_id": 0})
+    if not category:
+        raise HTTPException(status_code=404, detail="About category not found")
+    return category
+
+
+@api_router.post("/about-categories")
+async def create_about_category(
+    category: AboutCategory,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Create about category (Admin only)"""
+    doc = category.model_dump()
+
+    if not doc["slug"]:
+        doc["slug"] = doc["name"].strip().lower().replace(" ", "-")
+
+    doc["created_at"] = doc["created_at"].isoformat()
+    doc["updated_at"] = doc["updated_at"].isoformat()
+
+    await db.about_categories.insert_one(doc)
+    return {"message": "About category created successfully", "id": category.id}
+
+
+@api_router.put("/about-categories/{category_id}")
+async def update_about_category(
+    category_id: str,
+    updates: Dict[str, Any],
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Update about category (Admin only)"""
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    if "name" in updates and "slug" not in updates:
+        updates["slug"] = updates["name"].strip().lower().replace(" ", "-")
+
+    result = await db.about_categories.update_one({"id": category_id}, {"$set": updates})
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="About category not found")
+
+    return {"message": "About category updated successfully"}
+
+
+@api_router.delete("/about-categories/{category_id}")
+async def delete_about_category(
+    category_id: str,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Delete about category (Admin only)"""
+    result = await db.about_categories.delete_one({"id": category_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="About category not found")
+
+    await db.about_sections.delete_many({"category_id": category_id})
+
+    return {"message": "About category and linked sections deleted successfully"}
+
+
+# ==================== ABOUT SECTION ROUTES ====================
+
+@api_router.get("/about-sections")
+async def get_about_sections(
+    category_id: Optional[str] = None,
+    published: bool = True
+):
+    """Get all about sections"""
+    query = {"published": published}
+
+    if category_id:
+        query["category_id"] = category_id
+
+    sections = await db.about_sections.find(query, {"_id": 0}).sort("sort_order", 1).to_list(1000)
+    return sections
+
+
+@api_router.get("/about-sections/{section_id}")
+async def get_about_section(section_id: str):
+    """Get single about section"""
+    section = await db.about_sections.find_one({"id": section_id}, {"_id": 0})
+    if not section:
+        raise HTTPException(status_code=404, detail="About section not found")
+    return section
+
+
+@api_router.post("/about-sections")
+async def create_about_section(
+    section: AboutSection,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Create about section (Admin only)"""
+    category = await db.about_categories.find_one({"id": section.category_id})
+    if not category:
+        raise HTTPException(status_code=404, detail="Linked about category not found")
+
+    doc = section.model_dump()
+    doc["created_at"] = doc["created_at"].isoformat()
+    doc["updated_at"] = doc["updated_at"].isoformat()
+
+    await db.about_sections.insert_one(doc)
+    return {"message": "About section created successfully", "id": section.id}
+
+
+@api_router.put("/about-sections/{section_id}")
+async def update_about_section(
+    section_id: str,
+    updates: Dict[str, Any],
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Update about section (Admin only)"""
+    if "category_id" in updates:
+        category = await db.about_categories.find_one({"id": updates["category_id"]})
+        if not category:
+            raise HTTPException(status_code=404, detail="Linked about category not found")
+
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    result = await db.about_sections.update_one({"id": section_id}, {"$set": updates})
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="About section not found")
+
+    return {"message": "About section updated successfully"}
+
+
+@api_router.delete("/about-sections/{section_id}")
+async def delete_about_section(
+    section_id: str,
+    payload: dict = Depends(verify_jwt_token)
+):
+    """Delete about section (Admin only)"""
+    result = await db.about_sections.delete_one({"id": section_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="About section not found")
+
+    return {"message": "About section deleted successfully"}
+
+# ==================== NEWS ROUTES ====================
+
+@api_router.get("/news")
+async def get_news(published: bool = True):
+    """Get all news articles"""
+    query = {"published": published} if published else {}
+    news = await db.news_articles.find(query, {"_id": 0}).sort("published_at", -1).to_list(1000)
+    return news
+
+@api_router.post("/news")
+async def create_news(article: NewsArticle, payload: dict = Depends(verify_jwt_token)):
+    """Create news article (Admin only)"""
+    doc = article.model_dump()
+    doc['created_at'] = doc['created_at'].isoformat()
+    doc['updated_at'] = doc['updated_at'].isoformat()
+    if doc.get('published_at'):
+        doc['published_at'] = doc['published_at'].isoformat()
+    await db.news_articles.insert_one(doc)
+    return {"message": "News article created successfully", "id": article.id}
+
+@api_router.put("/news/{news_id}")
+async def update_news(news_id: str, updates: Dict[str, Any], payload: dict = Depends(verify_jwt_token)):
+    """Update news article (Admin only)"""
+    updates['updated_at'] = datetime.now(timezone.utc).isoformat()
+    result = await db.news_articles.update_one({"id": news_id}, {"$set": updates})
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="News article not found")
+    return {"message": "News article updated successfully"}
+
+@api_router.delete("/news/{news_id}")
+async def delete_news(news_id: str, payload: dict = Depends(verify_jwt_token)):
+    """Delete news article (Admin only)"""
+    result = await db.news_articles.delete_one({"id": news_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="News article not found")
+    return {"message": "News article deleted successfully"}
+
+# ==================== EMPLOYEE ROUTES ====================
+
+@api_router.get("/employees")
+async def get_employees(status: Optional[str] = None):
+    """Get all employees"""
+    query = {}
+    if status:
+        query["status"] = status
+    employees = await db.employees.find(query, {"_id": 0}).sort("name", 1).to_list(1000)
+    return employees
+
+@api_router.post("/employees")
+async def create_employee(employee: Employee, payload: dict = Depends(verify_jwt_token)):
+    """Create employee (Admin only)"""
+    doc = employee.model_dump()
+    doc['created_at'] = doc['created_at'].isoformat()
+    doc['updated_at'] = doc['updated_at'].isoformat()
+    if doc.get('join_date'):
+        doc['join_date'] = doc['join_date'].isoformat()
+    await db.employees.insert_one(doc)
+    return {"message": "Employee created successfully", "id": employee.id}
+
+@api_router.put("/employees/{employee_id}")
+async def update_employee(employee_id: str, updates: Dict[str, Any], payload: dict = Depends(verify_jwt_token)):
+    """Update employee (Admin only)"""
+    updates['updated_at'] = datetime.now(timezone.utc).isoformat()
+    result = await db.employees.update_one({"id": employee_id}, {"$set": updates})
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    return {"message": "Employee updated successfully"}
+
+@api_router.delete("/employees/{employee_id}")
+async def delete_employee(employee_id: str, payload: dict = Depends(verify_jwt_token)):
+    """Delete employee (Admin only)"""
+    result = await db.employees.delete_one({"id": employee_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    return {"message": "Employee deleted successfully"}
+# =================== CONTACT ROUTES ======================
+@app.get("/api/contact", response_model=ContactPageSchema)
+async def get_contact_page():
+    contact_doc = await db.contact_page.find_one({})
+
+    if not contact_doc:
+        await db.contact_page.insert_one(default_contact_data)
+        contact_doc = await db.contact_page.find_one({})
+
+    contact_doc.pop("_id", None)
+    return contact_doc
+@app.put("/api/contact")
+async def update_contact_page(payload: ContactPageSchema):
+    existing = await db.contact_page.find_one({})
+
+    if existing:
+        await db.contact_page.update_one(
+            {"_id": existing["_id"]},
+            {"$set": payload.dict()}
+        )
+    else:
+        await db.contact_page.insert_one(payload.dict())
+
+    return {"message": "Contact page updated successfully"}
+
+# ==================== BASIC ROUTES ====================
+
+@api_router.get("/")
+async def root():
+    return {"message": "Digital Integrator CMS API", "version": "1.0.0"}
+
+@api_router.get("/health")
+async def health_check():
+    return {"status": "healthy", "database": "connected"}
+
+# Include router in app
+app.include_router(api_router)
+
+# CORS Middleware
+# CORS Middleware
+allowed_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+extra_origins = os.environ.get("CORS_ORIGINS", "")
+if extra_origins:
+    allowed_origins.extend(
+        [origin.strip() for origin in extra_origins.split(",") if origin.strip()]
+    )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def seed_about_categories():
+    default_categories = [
+        {
+            "id": str(uuid.uuid4()),
+            "name": "Director",
+            "slug": "director",
+            "description": "Director section",
+            "sort_order": 1,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        },
+        {
+            "id": str(uuid.uuid4()),
+            "name": "Company Overview",
+            "slug": "company-overview",
+            "description": "Company overview section",
+            "sort_order": 2,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        },
+        {
+            "id": str(uuid.uuid4()),
+            "name": "Advisory",
+            "slug": "advisory",
+            "description": "Advisory section",
+            "sort_order": 3,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+    ]
+
+    for category in default_categories:
+        existing = await db.about_categories.find_one({"slug": category["slug"]})
+        if not existing:
+            await db.about_categories.insert_one(category)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
